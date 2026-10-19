@@ -45,13 +45,13 @@ def _colab_transcriber(audio, root, metadata, *, model_name, progress):
     _setup_ffmpeg()
     # CUDA libraries must be on LD_LIBRARY_PATH BEFORE the worker starts.
     # The worker also isolates native imports from Colab's preloaded packages.
-    if not globals().get('_subtitle_whisper_ready'):
+    if globals().get('_subtitle_whisper_ready') != WHISPER_PACKAGES:
         progress('Richte Spracherkennung ein (nur beim ersten Bedarf) …')
-        _install('faster-whisper>=1.2,<2')
+        _install(*WHISPER_PACKAGES)
         gpu = subprocess.run(['nvidia-smi', '-L'], capture_output=True).returncode == 0 if shutil.which('nvidia-smi') else False
         if gpu:
             _install('nvidia-cublas-cu12>=12,<13', 'nvidia-cudnn-cu12>=9,<10')
-        _subtitle_whisper_ready = True
+        _subtitle_whisper_ready = WHISPER_PACKAGES
     environment = dict(os.environ)
     library_dirs = []
     for location in sys.path:
@@ -67,7 +67,11 @@ def _colab_transcriber(audio, root, metadata, *, model_name, progress):
     worker.write_text(_SUBTITLE_CORE + '''
 import sys
 job = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
-result = transcribe_audio(Path(job['audio']), Path(job['root']), job['metadata'], model_name=job['model_name'])
+try:
+    result = transcribe_audio(Path(job['audio']), Path(job['root']), job['metadata'], model_name=job['model_name'])
+except Exception as error:
+    Path(sys.argv[2]).write_text(json.dumps({'error': str(error), 'details': error_detail(error)}), encoding='utf-8')
+    sys.exit(1)
 Path(sys.argv[2]).write_text(json.dumps({
     'title': result.title, 'source': result.source, 'language': result.language,
     'directory': str(result.directory), 'files': [str(p) for p in result.files], 'archive': str(result.archive)
@@ -82,9 +86,10 @@ Path(sys.argv[2]).write_text(json.dumps({
             recent = recent[-12:]
             progress(line.rstrip())
         if process.wait() != 0:
-            raise SubtitleError('Die Spracherkennung wurde unterbrochen. Gesicherte Abschnitte bleiben erhalten. '
-                                'Bei CUDA-Fehlern die Laufzeit neu starten oder auf CPU wechseln.\n'
-                                + '\n'.join(recent[-5:]))
+            failure = json.loads(result_path.read_text(encoding='utf-8')) if result_path.exists() else {}
+            reason = failure.get('error') or 'Der Spracherkennungsprozess wurde beendet.'
+            raise SubtitleError(reason + '\nGesicherte Abschnitte und die Tonspur bleiben erhalten.',
+                                details=failure.get('details') or '\n'.join(recent[-10:]))
         data = json.loads(result_path.read_text(encoding='utf-8'))
         return Result(data['title'], data['source'], data['language'], Path(data['directory']),
                       [Path(path) for path in data['files']], Path(data['archive']))
@@ -132,7 +137,7 @@ def _show_result(result):
 def _start_colab():
     from google.colab import files
 
-    print('Untertitel-Tool · Version 1.3', flush=True)
+    print('Untertitel-Tool · Version 1.4', flush=True)
     if not Datei_hochladen:
         youtube_url(YouTube_Link)  # Fail before installing anything for an empty link.
         _setup_ytdlp()

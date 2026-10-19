@@ -27,7 +27,7 @@ ZIP_automatisch_herunterladen = True #@param {type:"boolean"}
 source = form + f'_SUBTITLE_CORE = {core!r}\nexec(compile(_SUBTITLE_CORE, "subtitle_tool.py", "exec"))\n\n' + ui
 intro = '''# YouTube → Untertitel & Transkript
 
-**Version 1.3** · Zwei Abrufwege für vorhandene Untertitel: zuerst direkt, dann mit yt-dlp. Fehler zeigen jetzt die genaue Ursache je Abrufweg. Bei veraltetem Live-Status **Stream_bereits_beendet** anhaken.
+**Version 1.4** · Behebt den Whisper-Startfehler `metadata_errors`: passende Paketversionen und ein Audio-Decodertest vor dem Modellstart. Zwei Abrufwege für vorhandene Untertitel bleiben enthalten. Bei veraltetem Live-Status **Stream_bereits_beendet** anhaken.
 
 **Link einfügen. ▶ drücken. Dateien herunterladen.** Funktioniert im Browser auf Handy, Tablet und PC.
 

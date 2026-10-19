@@ -424,7 +424,8 @@ class TestResume(unittest.TestCase):
                    'faster_whisper': types.SimpleNamespace(WhisperModel=FakeWhisper)}
         FakeWhisper.attempts, FakeWhisper.should_fail = 0, True
         with tempfile.TemporaryDirectory() as temporary, patch.dict(sys.modules, modules), \
-                patch.object(app, 'audio_duration', return_value=601), patch.object(app.subprocess, 'run'):
+                patch.object(app, 'audio_duration', return_value=601), patch.object(app.subprocess, 'run'), \
+                patch.object(app, 'check_audio_decoder'):
             root = Path(temporary)
             audio = root / 'audio.wav'
             audio.write_bytes(b'stable audio fixture')

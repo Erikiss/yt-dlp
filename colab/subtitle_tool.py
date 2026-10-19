@@ -10,6 +10,7 @@ import argparse
 import copy
 import hashlib
 import html
+import io
 import json
 import math
 import re
@@ -18,6 +19,7 @@ import subprocess
 import tempfile
 import textwrap
 import time
+import wave
 import zipfile
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -28,6 +30,7 @@ from urllib.parse import parse_qs, urlparse
 TOOL_VERSION = 1
 CHUNK_SECONDS = 600
 CONTEXT_SECONDS = 3
+WHISPER_PACKAGES = ('faster-whisper==1.2.1', 'av==18.1.0')
 
 
 class SubtitleError(RuntimeError):
@@ -550,6 +553,31 @@ def file_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
+def check_audio_decoder() -> None:
+    """Check the actual Whisper/PyAV boundary before loading a large model."""
+    from faster_whisper.audio import decode_audio
+
+    sample = io.BytesIO()
+    with wave.open(sample, 'wb') as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(16000)
+        output.writeframes(b'\x00\x00' * 800)
+    sample.seek(0)
+    try:
+        decoded = decode_audio(sample, sampling_rate=16000)
+        if len(decoded) != 800:
+            raise ValueError('Der Audio-Decodertest hat eine unerwartete Länge geliefert.')
+    except Exception as error:
+        if 'metadata_errors' in str(error):
+            message = ('Die installierten Versionen von faster-whisper und PyAV sind nicht kompatibel. '
+                       'Bitte faster-whisper==1.2.1 und av==18.1.0 installieren; '
+                       'die aktuelle Colab-Version erledigt das automatisch. Die Tonspur bleibt erhalten.')
+        else:
+            message = 'Der Audio-Decodertest ist fehlgeschlagen. Die Tonspur bleibt erhalten.'
+        raise SubtitleError(message, details=error_detail(error)) from error
+
+
 def transcribe_audio(audio: Path, root: Path, metadata: dict, *, model_name='auto', progress=print) -> Result:
     try:
         import ctranslate2
@@ -595,6 +623,8 @@ def transcribe_audio(audio: Path, root: Path, metadata: dict, *, model_name='aut
         progress('Vollständige Sicherung gefunden – kein erneutes Transkribieren nötig.')
         return make_result(directory, cues, metadata)
 
+    check_audio_decoder()
+    progress('Audio-Decodertest erfolgreich.')
     progress(f'Spracherkennung: {model_name} auf {device}; {count} Abschnitte à höchstens 10 Minuten.')
     progress(f'Zwischenstände: {directory}')
     if state['next_chunk']:

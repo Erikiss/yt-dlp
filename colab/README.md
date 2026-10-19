@@ -2,6 +2,10 @@
 
 [![In Colab öffnen](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Erikiss/yt-dlp/blob/subtitle-colab/colab/YouTube_Untertitel.ipynb)
 
+**Version 1.4:** Behebt `TypeError: open() got an unexpected keyword argument 'metadata_errors'` beim Start von Whisper. `faster-whisper==1.2.1` wird zusammen mit `av==18.1.0` installiert; PyAV 19 hat das von dieser Whisper-Version verwendete Argument entfernt ([Upstream-Fehlerbericht](https://github.com/SYSTRAN/faster-whisper/issues/1589)). Vor dem Modellstart wird der echte Audio-Decoder mit einer kurzen WAV-Datei geprüft. Die Einrichtung erkennt auch eine bereits ausgeführte ältere Notebook-Version. Workerfehler werden mit ihrer tatsächlichen Meldung zurückgegeben. Vorhandene Audio- und Transkriptionssicherungen bleiben kompatibel.
+
+**Eine laufende Sitzung mit Version 1.3 reparieren:** Eine zusätzliche Codezelle mit `%pip install -q "faster-whisper==1.2.1" "av==18.1.0"` ausführen und anschließend die bisherige Startzelle erneut starten. Die Laufzeit dafür nicht zurücksetzen: Die Tonspur unter `/content` bleibt dann erhalten. Whisper läuft in einem neuen Unterprozess und lädt dort die korrigierten Pakete; ein Neustart der Colab-Laufzeit ist dafür nicht erforderlich.
+
 **Version 1.3:** Vorhandene Untertitel werden zuerst über `youtube-transcript-api==1.2.4` angefragt. Dieser Weg benötigt keine Audio-/Videoformate und berücksichtigt die Originalsprache sowie den Live-Status aus derselben Playerantwort. Falls er scheitert, folgt yt-dlp. Ein Playerfehler beendet die Metadatensuche nicht mehr vor der Untertitelauswertung; wenn auch dort keine Untertitel abrufbar sind, bleibt der Playerfehler in der Diagnose erhalten. Im Metadatenlauf werden keine HLS-/DASH-Manifeste geladen. Fehler zeigen je Abrufweg den Typ und die tatsächliche Meldung; URL-Abfrageparameter werden entfernt. Zwei Abrufwege garantieren keinen Zugriff aus jeder Cloud-Umgebung. Der konkret gemeldete Videolink konnte hier bisher nicht erfolgreich als Transkript abgerufen werden.
 
 **Version 1.2:** Beendete Streams (`was_live`/`post_live`) haben Vorrang vor einem widersprüchlichen `is_live`-Flag. Ein Endzeitpunkt in den YouTube-Metadaten korrigiert veraltete Live-Angaben schon vor der Formatauswahl. Wenn YouTube trotzdem weiter „live“ meldet, kann man **Stream_bereits_beendet** bestätigen. Vorhandene Untertitel werden dann abgerufen. Für noch nicht fertig verarbeitete/so bestätigte Aufzeichnungen werden nur endliche HTTP(S)-Mediendateien mit bekannter Dateigröße für Whisper gewählt; rollende Manifest-Ausschnitte werden nicht als vollständige Aufzeichnung ausgegeben. Die verfügbare Tonspur wird bei bekannter Gesamtdauer auf deutliche Verkürzung geprüft. Ein zu kurzer Download wird als `audio.incomplete.*` abgelegt, damit ein neuer Versuch die fertige Tonspur erneut abrufen kann.
@@ -62,7 +66,7 @@ Auf iPhone/iPad Colab möglichst in Safari öffnen. Falls der automatische Downl
 
 ## Außerhalb von Colab
 
-Voraussetzungen: Python 3.10+, FFmpeg; für GPU-Whisper die passenden CUDA-12-/cuDNN-9-Bibliotheken. Für reine vorhandene Untertitel ist FFmpeg nicht erforderlich.
+Voraussetzungen: Python 3.11+, FFmpeg; für GPU-Whisper die passenden CUDA-12-/cuDNN-9-Bibliotheken. Für reine vorhandene Untertitel ist FFmpeg nicht erforderlich.
 
 ```bash
 python -m pip install 'yt-dlp[default,deno] @ git+https://github.com/Erikiss/yt-dlp.git@897341241f2bfb2439fe0367f4c7c9ccd29a3828'
@@ -70,7 +74,7 @@ python -m pip install 'youtube-transcript-api==1.2.4'
 python colab/subtitle_tool.py 'https://www.youtube.com/watch?v=VIDEO_ID' --mode subtitles
 
 # Optional: Sprache erkennen
-python -m pip install 'faster-whisper>=1.2,<2'
+python -m pip install 'faster-whisper==1.2.1' 'av==18.1.0'
 python colab/subtitle_tool.py --file lecture.mp3 --model small
 ```
 
@@ -84,6 +88,8 @@ python colab/build_notebook.py
 ```
 
 Die 31 Offlineprüfungen decken URL-Validierung, Sprachwahl, rollende Wiederholungen, lange Transkripte, ZIP/SRT/TXT-Ausgaben, Zugriffsfehler und unterbrochene/fertiggestellte Whisper-Sicherungen ab. Für beendete Streams prüfen sie außerdem widersprüchliche Live-Angaben, vergangene/zukünftige Endzeiten im echten Extractor, die ausdrückliche Bestätigung, unvollständige Audioformate und zu kurze Downloads. Der echte Transkriptclient wird mit HTTP-Testantworten geprüft; dabei darf kein Medienabruf gestartet werden. Weitere Fälle prüfen abrufbare Untertitel trotz Playerfehler und die Diagnose beider fehlgeschlagener Wege. Die Whisper-Prüfung simuliert das Modell; sie misst keine Erkennungsqualität und prüft keinen echten GPU-Lauf. Ein vollständiger Durchlauf in Google Colab muss mit einem tatsächlich zugänglichen Video erfolgen.
+
+Für Version 1.4 wurde der gemeldete Fehler zusätzlich mit den echten Paketen `faster-whisper==1.2.1` und `av==19.0.1` reproduziert. Nach Installation von `av==18.1.0` bestanden sowohl der Decodertest als auch das Einlesen einer von FFmpeg erzeugten WAV-Datei (6.400 Float32-Samples bei 16 kHz). Für Python 3.13 wurde die Verfügbarkeit des passenden Linux-Wheels geprüft; der Decoderlauf selbst fand unter Python 3.12 statt.
 
 Primärdokumentation: [yt-dlp](https://github.com/yt-dlp/yt-dlp#readme), [YouTube-JavaScript-Runtime/EJS](https://github.com/yt-dlp/yt-dlp/wiki/EJS), [faster-whisper](https://github.com/SYSTRAN/faster-whisper), [Colab-FAQ](https://research.google.com/colaboratory/faq.html).
 
