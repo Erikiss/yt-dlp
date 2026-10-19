@@ -1,5 +1,6 @@
 """Offline regression checks for complete transcripts and restart safety."""
 
+import copy
 import json
 import sys
 import tempfile
@@ -7,7 +8,7 @@ import types
 import unittest
 import zipfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import subtitle_tool as app
 
@@ -127,11 +128,140 @@ class TestWorkflow(unittest.TestCase):
     def test_live_stream_rejected(self):
         FakeYDL.info['is_live'] = True
         with tempfile.TemporaryDirectory() as temporary, patch.object(app, 'youtube_downloader', FakeYDL):
-            with self.assertRaisesRegex(app.SubtitleError, 'Livestreams'):
+            with self.assertRaisesRegex(app.SubtitleError, 'Stream_bereits_beendet'):
                 app.run('QRS8MkLhQmM', output_dir=temporary, progress=lambda _: None)
+
+    def test_ended_status_or_confirmation_allows_captions_despite_live_flag(self):
+        raw = json.dumps({'events': [{'tStartMs': 0, 'dDurationMs': 2000, 'segs': [{'utf8': 'Archive.'}]}]})
+        FakeYDL.info.update(is_live=True, subtitles={'en': [{'ext': 'json3', 'data': raw}]})
+        cases = [('was_live', False), ('post_live', False), ('is_live', True)]
+        with tempfile.TemporaryDirectory() as temporary, patch.object(app, 'youtube_downloader', FakeYDL):
+            for status, confirmed in cases:
+                with self.subTest(status=status, confirmed=confirmed):
+                    FakeYDL.info['live_status'] = status
+                    result = app.run('https://www.youtube.com/live/QRS8MkLhQmM', output_dir=temporary,
+                                     stream_ended=confirmed, progress=lambda _: None,
+                                     transcriber=lambda *args, **kwargs: self.fail('Unexpected Whisper'))
+                    self.assertEqual((result.directory / 'transkript.txt').read_text().strip(), 'Archive.')
+                    meta = json.loads((result.directory / 'info.json').read_text())
+                    self.assertEqual(meta['stream_ended_confirmed'], confirmed)
+
+    def test_processing_archive_without_captions_has_specific_message(self):
+        FakeYDL.info.update(live_status='post_live', is_live=False)
+        with tempfile.TemporaryDirectory() as temporary, patch.object(app, 'youtube_downloader', FakeYDL):
+            with self.assertRaisesRegex(app.SubtitleError, 'Aufzeichnung.*keine Untertitel'):
+                app.run('QRS8MkLhQmM', mode='subtitles', output_dir=temporary, progress=lambda _: None)
+
+
+class FakeAudioYDL(FakeYDL):
+    download_info = None
+    selected = None
+
+    def build_format_selector(self, specification):
+        from yt_dlp import YoutubeDL
+
+        with YoutubeDL({'quiet': True}) as ydl:
+            return ydl.build_format_selector(specification)
+
+    def extract_info(self, url, download=False):
+        info = copy.deepcopy(self.download_info if download and self.download_info else self.info)
+        if download:
+            self.options['match_filter'](info, incomplete=False)
+            context = {'formats': info['formats'], 'has_merged_format': False, 'incomplete_formats': True}
+            selected = list(self.options['format'](context))[-1]
+            type(self).selected = selected
+            info.update(selected)
+            self.path = Path(self.options['outtmpl'].replace('%(ext)s', info['ext']))
+            self.path.write_bytes(b'placeholder audio')
+        return info
+
+    def prepare_filename(self, info):
+        return str(self.path)
+
+
+class TestRecentArchiveAudio(unittest.TestCase):
+    def setUp(self):
+        self.audio_format = {'format_id': 'audio', 'protocol': 'https', 'filesize': 1000,
+                             'acodec': 'opus', 'vcodec': 'none', 'ext': 'webm', 'url': 'https://example.test/audio'}
+        self.rolling_format = {**self.audio_format, 'format_id': 'rolling', 'protocol': 'm3u8_native'}
+        FakeAudioYDL.info = {'id': 'QRS8MkLhQmM', 'title': 'Archive', 'duration': 50000,
+                             'live_status': 'post_live', 'formats': [self.audio_format, self.rolling_format]}
+        FakeAudioYDL.download_info, FakeAudioYDL.selected = None, None
+
+    def test_finite_audio_preferred_over_manifest_or_large_video(self):
+        video = {**self.audio_format, 'format_id': 'video', 'vcodec': 'h264'}
+        formats = [self.audio_format, self.rolling_format, video]
+        self.assertEqual(list(app.recording_audio_format({'formats': formats})), [self.audio_format])
+        self.assertEqual(list(app.recording_audio_format({'formats': [video]})), [video])
+
+    def test_incomplete_audio_and_unknown_length_are_not_full_recordings(self):
+        for overrides in ({'filesize': None}, {'filesize': 0}, {'target_duration': 5},
+                          {'is_from_start': True}, {'format_note': '(Last 2 hours)'},
+                          {'format_note': '(incomplete)'}, {'protocol': 'm3u8_native'}):
+            with self.subTest(overrides=overrides), self.assertRaisesRegex(app.SubtitleError, 'fertige Datei'):
+                list(app.recording_audio_format({'formats': [{**self.audio_format, **overrides}]}))
+
+    def test_confirmed_ended_and_post_live_downloads_reach_transcriber(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(app, 'youtube_downloader', FakeAudioYDL), \
+                patch.object(app, 'audio_duration', return_value=50000):
+            for status, confirmed in [('post_live', False), ('is_live', True), ('was_live', False)]:
+                with self.subTest(status=status):
+                    FakeAudioYDL.info.update(live_status=status, is_live=status == 'is_live')
+                    transcriber = Mock(return_value='finished')
+                    result = app.run('QRS8MkLhQmM', output_dir=temporary, stream_ended=confirmed,
+                                     transcriber=transcriber, progress=lambda _: None)
+                    self.assertEqual(result, 'finished')
+                    transcriber.assert_called_once()
+                    if status != 'was_live':
+                        self.assertEqual(FakeAudioYDL.selected['format_id'], 'audio')
+
+    def test_refreshed_metadata_prevents_live_capture_and_rolling_tail(self):
+        FakeAudioYDL.info['live_status'] = 'was_live'
+        with tempfile.TemporaryDirectory() as temporary, patch.object(app, 'youtube_downloader', FakeAudioYDL):
+            for status, message in [('is_live', 'erneut einen Live-Status'), ('post_live', 'fertige Datei')]:
+                with self.subTest(status=status):
+                    FakeAudioYDL.download_info = {**FakeAudioYDL.info, 'live_status': status,
+                                                  'formats': [self.rolling_format]}
+                    with self.assertRaisesRegex(app.SubtitleError, message):
+                        app.run('QRS8MkLhQmM', output_dir=temporary, progress=lambda _: None,
+                                transcriber=lambda *args, **kwargs: self.fail('Unexpected Whisper'))
+
+    def test_short_audio_is_not_reused_or_transcribed(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(app, 'youtube_downloader', FakeAudioYDL), \
+                patch.object(app, 'audio_duration', return_value=7200):
+            with self.assertRaisesRegex(app.SubtitleError, 'deutlich kürzer'):
+                app.run('QRS8MkLhQmM', output_dir=temporary, progress=lambda _: None,
+                        transcriber=lambda *args, **kwargs: self.fail('Unexpected Whisper'))
+            cache = Path(temporary) / '_audio' / 'QRS8MkLhQmM'
+            self.assertFalse((cache / 'audio.webm').exists())
+            self.assertTrue((cache / 'audio.incomplete.webm').exists())
 
 
 class TestRealYoutubeExtractor(unittest.TestCase):
+    def test_past_end_timestamp_corrects_live_before_format_extraction(self):
+        microformats = [{'liveBroadcastDetails': {'isLiveNow': True, 'endTimestamp': '2020-01-01T00:00:00Z'}}]
+        details = [{'isLive': True, 'isUpcoming': True}]
+        with app.youtube_downloader(app.ydl_options()) as ydl:
+            extractor = ydl.get_info_extractor('Youtube')
+            for post_live, expected in [(False, 'was_live'), (True, 'post_live')]:
+                details[0]['isPostLiveDvr'] = post_live
+                original = copy.deepcopy((microformats, details))
+                with patch.object(extractor, '_extract_formats_and_subtitles', return_value=iter([{}])) as extract:
+                    result = extractor._list_formats('QRS8MkLhQmM', microformats, details, [], None)
+                self.assertEqual(result[1], expected)
+                self.assertEqual(extract.call_args.args[3], expected)
+                self.assertEqual((microformats, details), original, 'Do not mutate other extractor inputs')
+            with patch.object(extractor, '_extract_formats_and_subtitles', return_value=iter([{}])):
+                self.assertEqual(extractor._list_formats('QRS8MkLhQmM', microformats, [], [], None)[1], 'was_live')
+
+    def test_future_or_missing_end_timestamp_preserves_live_status(self):
+        with app.youtube_downloader(app.ydl_options()) as ydl:
+            extractor = ydl.get_info_extractor('Youtube')
+            for timestamp in (None, '2999-01-01T00:00:00Z'):
+                microformats = [{'liveBroadcastDetails': {'isLiveNow': True, 'endTimestamp': timestamp}}]
+                with patch.object(extractor, '_extract_formats_and_subtitles', return_value=iter([{}])):
+                    self.assertEqual(extractor._list_formats('QRS8MkLhQmM', microformats, [], [], None)[1], 'is_live')
+
     def test_missing_duration_does_not_crash_and_patch_is_instance_local(self):
         from yt_dlp import YoutubeDL
 

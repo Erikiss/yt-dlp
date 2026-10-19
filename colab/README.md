@@ -2,6 +2,8 @@
 
 [![In Colab öffnen](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Erikiss/yt-dlp/blob/subtitle-colab/colab/YouTube_Untertitel.ipynb)
 
+**Version 1.2:** Beendete Streams (`was_live`/`post_live`) haben Vorrang vor einem widersprüchlichen `is_live`-Flag. Ein Endzeitpunkt in den YouTube-Metadaten korrigiert veraltete Live-Angaben schon vor der Formatauswahl. Wenn YouTube trotzdem weiter „live“ meldet, kann man **Stream_bereits_beendet** bestätigen. Vorhandene Untertitel werden dann abgerufen. Für noch nicht fertig verarbeitete/so bestätigte Aufzeichnungen werden nur endliche HTTP(S)-Mediendateien mit bekannter Dateigröße für Whisper gewählt; rollende Manifest-Ausschnitte werden nicht als vollständige Aufzeichnung ausgegeben. Die verfügbare Tonspur wird bei bekannter Gesamtdauer auf deutliche Verkürzung geprüft. Ein zu kurzer Download wird als `audio.incomplete.*` abgelegt, damit ein neuer Versuch die fertige Tonspur erneut abrufen kann.
+
 **Version 1.1:** Behebt den gemeldeten Fehler `unsupported operand type(s) for /: 'NoneType' and 'float'`. yt-dlp berechnete Vorschaubild-Zeitangaben trotz fehlender Videolänge. Der Untertitel-Einstieg überspringt diese unbenötigten Storyboards in einer eigenen Extractor-Instanz. Explizite YouTube-Anmelde-/Zugriffsfehler werden auch im Metadatenmodus nicht mehr unterdrückt; Fehlermeldungen werden auf kleinen Bildschirmen umgebrochen. Die Sicherungen vorhandener Transkriptionsläufe bleiben kompatibel.
 
 ## Sofort starten
@@ -19,7 +21,9 @@ Keine Kommandozeile, kein API-Key und kein lokales Installieren nötig. Das Note
 - Der Modus **Nur vorhandene Untertitel** verhindert jede KI-Transkription. **KI neu erzeugen** nutzt Whisper auch bei vorhandenen Untertiteln.
 - Vorhandene Untertitel benötigen keine GPU. Whisper nutzt bei `auto` **turbo auf GPU** und **small auf CPU**. Für lange Videos ist eine T4 sinnvoll; eine A100 ist nicht nötig. Die Laufzeit wird von diesem Notebook nicht automatisch umgestellt.
 - Keine Übersetzung, Zusammenfassung oder künstliche Längenbegrenzung. Erkennungsfehler bleiben möglich, besonders bei Fachbegriffen, Musik und überlappender Sprache.
-- Laufende/angekündigte Livestreams und Playlists werden nicht verarbeitet. Ein Videolink mit Playlist-Zusatz verarbeitet nur dieses Video.
+- `/live/VIDEO_ID` ist auch für beendete Aufzeichnungen gültig. Ein noch als live gemeldetes Video wird erst nach Bestätigung **Stream_bereits_beendet** als Aufzeichnung versucht. Eine dauerhafte Liveaufnahme und Playlists werden nicht verarbeitet. Ein Videolink mit Playlist-Zusatz verarbeitet nur dieses Video.
+
+Kurz nach dem Ende können die fertige Tonspur oder automatische Untertitel noch fehlen. YouTube erstellt automatische Untertitel für die Aufzeichnung neu; die Live-Untertitel werden nicht einfach übernommen ([YouTube-Hilfe](https://support.google.com/youtube/answer/6373554?hl=de)). Die Bestätigung „Stream bereits beendet“ ändert diese Verfügbarkeit nicht. Fehlen die nötigen Daten, später erneut starten. Eine feste Wartezeit lässt sich nicht zusagen.
 
 ## Dateien
 
@@ -75,7 +79,7 @@ python -m unittest discover -s colab -p 'test_subtitle_tool.py' -v
 python colab/build_notebook.py
 ```
 
-Die Offlineprüfungen decken URL-Validierung, Sprachwahl, rollende Wiederholungen, lange Transkripte, ZIP/SRT/TXT-Ausgaben, Zugriffsfehler und unterbrochene/fertiggestellte Whisper-Sicherungen ab. Die Whisper-Prüfung simuliert das Modell; sie misst keine Erkennungsqualität und prüft keinen echten GPU-Lauf. Ein vollständiger Live-Durchlauf in Google Colab muss mit einem tatsächlich zugänglichen Video erfolgen.
+Die 25 Offlineprüfungen decken URL-Validierung, Sprachwahl, rollende Wiederholungen, lange Transkripte, ZIP/SRT/TXT-Ausgaben, Zugriffsfehler und unterbrochene/fertiggestellte Whisper-Sicherungen ab. Für beendete Streams prüfen sie außerdem widersprüchliche Live-Angaben, vergangene/zukünftige Endzeiten im echten Extractor, die ausdrückliche Bestätigung, unvollständige Audioformate und zu kurze Downloads. Die Whisper-Prüfung simuliert das Modell; sie misst keine Erkennungsqualität und prüft keinen echten GPU-Lauf. Ein vollständiger Durchlauf in Google Colab muss mit einem tatsächlich zugänglichen Video erfolgen.
 
 Primärdokumentation: [yt-dlp](https://github.com/yt-dlp/yt-dlp#readme), [YouTube-JavaScript-Runtime/EJS](https://github.com/yt-dlp/yt-dlp/wiki/EJS), [faster-whisper](https://github.com/SYSTRAN/faster-whisper), [Colab-FAQ](https://research.google.com/colaboratory/faq.html).
 

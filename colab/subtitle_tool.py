@@ -7,6 +7,7 @@ yt-dlp / optional faster-whisper are actually needed.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import html
 import json
@@ -16,6 +17,7 @@ import shutil
 import subprocess
 import tempfile
 import textwrap
+import time
 import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -265,6 +267,34 @@ def youtube_error(error: Exception) -> SubtitleError:
     return SubtitleError(f'Abruf fehlgeschlagen: {message[:600]}')
 
 
+def is_ended_recording(info: dict) -> bool:
+    """An explicit ended status outranks an inconsistent legacy is_live flag."""
+    return info.get('live_status') in ('post_live', 'was_live') or info.get('was_live') is True
+
+
+def recording_audio_format(context: dict):
+    """Only choose finite files while a recently ended stream is processing.
+
+    A rolling live manifest can contain only the last part of a long recording.
+    Never silently label that tail as the full transcript or keep recording live.
+    """
+    candidates = [item for item in context.get('formats', [])
+                  if item.get('protocol') in ('http', 'https')
+                  and isinstance(item.get('filesize'), (int, float)) and item['filesize'] > 0
+                  and item.get('acodec') not in (None, 'none')
+                  and not item.get('target_duration') and not item.get('is_from_start')
+                  and 'incomplete' not in str(item.get('format_note', '')).lower()
+                  and 'last 2 hours' not in str(item.get('format_note', '')).lower()]
+    audio_only = [item for item in candidates if item.get('vcodec') == 'none']
+    available = audio_only or candidates
+    if not available:
+        raise SubtitleError(
+            'Der Stream ist beendet bzw. als beendet bestätigt. YouTube liefert hier aber noch keine '
+            'vollständige Tonspur als fertige Datei. Die Aufzeichnung kann noch verarbeitet werden. '
+            'Bitte später erneut starten; es wird nicht nur das letzte Stück des Streams transkribiert.')
+    yield available[-1]
+
+
 class QuietLogger:
     def debug(self, message):
         pass
@@ -289,7 +319,7 @@ def youtube_downloader(options: dict):
     """
     from yt_dlp import YoutubeDL
     from yt_dlp.extractor.youtube import YoutubeIE
-    from yt_dlp.utils import ExtractorError
+    from yt_dlp.utils import ExtractorError, parse_iso8601
 
     class SubtitleYoutubeIE(YoutubeIE):
         @classmethod
@@ -298,6 +328,27 @@ def youtube_downloader(options: dict):
 
         def _extract_storyboard(self, player_responses, duration):
             return iter(())
+
+        def _list_formats(self, video_id, microformats, video_details, player_responses, player_url, duration=None):
+            # A finished broadcast can still carry isLive=True in another client
+            # response. Its recorded end time is stronger evidence of an ending.
+            ended = any(
+                isinstance(item, dict)
+                and (end := parse_iso8601((item.get('liveBroadcastDetails') or {}).get('endTimestamp'))) is not None
+                and end <= time.time()
+                for item in (microformats or []))
+            if ended:
+                video_details = copy.deepcopy(video_details or [{}])
+                for item in video_details:
+                    item.update(isLive=False, isUpcoming=False, isLiveContent=True)
+                microformats = copy.deepcopy(microformats)
+                for item in microformats:
+                    if isinstance(item.get('liveBroadcastDetails'), dict):
+                        item['liveBroadcastDetails']['isLiveNow'] = False
+                # Preserve isPostLiveDvr: yt-dlp needs its distinction between a
+                # processed recording and a recording still being processed.
+            return super()._list_formats(video_id, microformats, video_details,
+                                         player_responses, player_url, duration)
 
         def raise_no_formats(self, msg, expected=False, video_id=None):
             # Metadata-only extraction may allow missing media formats, but
@@ -491,7 +542,7 @@ def transcribe_audio(audio: Path, root: Path, metadata: dict, *, model_name='aut
 
 def run(url: str = '', *, output_dir: str | Path = 'youtube_subtitles',
         local_file: str | Path | None = None, mode: str = 'auto', model_name: str = 'auto',
-        progress=print, transcriber=None) -> Result:
+        stream_ended: bool = False, progress=print, transcriber=None) -> Result:
     if mode not in ('auto', 'subtitles', 'whisper'):
         raise SubtitleError('Unbekannter Modus.')
     if model_name not in ('auto', 'small', 'medium', 'turbo', 'large-v3'):
@@ -513,14 +564,22 @@ def run(url: str = '', *, output_dir: str | Path = 'youtube_subtitles',
                 info = ydl.extract_info(canonical, download=False)
                 if not info or info.get('_type') in ('playlist', 'multi_video'):
                     raise SubtitleError('Kein einzelnes Video gefunden.')
-                if info.get('is_live') or info.get('live_status') in ('is_live', 'is_upcoming'):
-                    raise SubtitleError('Laufende oder angekündigte Livestreams sind nicht unterstützt. '
-                                        'Bitte nach dem Ende die Videoaufzeichnung verwenden.')
+                ended = is_ended_recording(info)
+                reports_live = info.get('is_live') or info.get('live_status') in ('is_live', 'is_upcoming')
+                if reports_live and not ended and not stream_ended:
+                    raise SubtitleError(
+                        'YouTube meldet dieses Video noch als live oder angekündigt. '
+                        'Falls der Stream bereits beendet ist: „Stream_bereits_beendet“ anhaken und erneut starten. '
+                        'Der /live/-Link ist auch für Aufzeichnungen gültig.')
+                cautious_recording = info.get('live_status') == 'post_live' or bool(reports_live and (ended or stream_ended))
                 video_id = parse_qs(urlparse(canonical).query)['v'][0]
                 root = output_dir / video_id
                 metadata = {'title': info.get('title') or video_id, 'url': canonical,
-                            'video_id': video_id, 'duration_seconds': info.get('duration')}
+                            'video_id': video_id, 'duration_seconds': info.get('duration'),
+                            'reported_live_status': info.get('live_status'), 'stream_ended_confirmed': stream_ended}
                 progress(metadata['title'])
+                if cautious_recording:
+                    progress('Beendete Aufzeichnung: prüfe Untertitel und bereits fertig bereitgestellte Audiodateien.')
                 track = caption_track(info)
                 if mode != 'whisper' and track:
                     source, language, formats = track
@@ -535,17 +594,51 @@ def run(url: str = '', *, output_dir: str | Path = 'youtube_subtitles',
         except Exception as error:
             raise youtube_error(error) from error
         if mode == 'subtitles':
+            if ended or stream_ended:
+                raise SubtitleError('Für diese Aufzeichnung sind noch keine Untertitel abrufbar. '
+                                    'YouTube erstellt automatische Untertitel nach einem Livestream neu. '
+                                    'Später erneut versuchen oder „Automatisch“ für die Tonspur wählen.')
             raise SubtitleError('Keine vorhandenen Untertitel gefunden. Für Spracherkennung „Automatisch“ wählen.')
         progress('Lade nur die Tonspur für die Spracherkennung …')
         cache = output_dir / '_audio' / video_id
         cache.mkdir(parents=True, exist_ok=True)
         try:
-            with youtube_downloader({**ydl_options(), 'format': 'bestaudio/best',
+            require_finite_audio = cautious_recording or stream_ended
+
+            def avoid_live_recording(latest_info, *, incomplete=False):
+                nonlocal require_finite_audio
+                latest_live = latest_info.get('is_live') or latest_info.get('live_status') in ('is_live', 'is_upcoming')
+                if latest_live and not is_ended_recording(latest_info) and not stream_ended:
+                    raise SubtitleError('YouTube meldet beim Audioabruf erneut einen Live-Status. '
+                                        'Bei einer beendeten Sendung „Stream_bereits_beendet“ aktivieren.')
+                if latest_info.get('live_status') == 'post_live' or latest_live:
+                    require_finite_audio = True
+
+            def select_audio(context):
+                if require_finite_audio:
+                    yield from recording_audio_format(context)
+                else:
+                    yield from ydl.build_format_selector('bestaudio/best')(context)
+
+            with youtube_downloader({**ydl_options(),
+                                     'format': select_audio,
+                                     'match_filter': avoid_live_recording,
+                                     'skip_unavailable_fragments': False,
                                      'outtmpl': str(cache / 'audio.%(ext)s')}) as ydl:
                 audio_info = ydl.extract_info(canonical, download=True)
                 audio = Path(ydl.prepare_filename(audio_info))
                 if not audio.is_file():
                     raise SubtitleError('Die Tonspur wurde nicht vollständig heruntergeladen.')
+                expected_duration = audio_info.get('duration') or metadata.get('duration_seconds')
+                if (ended or stream_ended or is_ended_recording(audio_info)) and isinstance(expected_duration, (int, float)) and expected_duration > 0:
+                    actual_duration = audio_duration(audio)
+                    if actual_duration < expected_duration - max(30, expected_duration * 0.02):
+                        # Do not keep reusing a cached tail after YouTube finishes
+                        # processing. Keep it separately for inspection instead.
+                        audio.replace(audio.with_name(f'audio.incomplete{audio.suffix}'))
+                        raise SubtitleError('Die geladene Tonspur ist deutlich kürzer als die Aufzeichnung. '
+                                            'YouTube hat möglicherweise noch nicht alles bereitgestellt. '
+                                            'Bitte später erneut starten; kein vollständiges Transkript erzeugt.')
         except SubtitleError:
             raise
         except Exception as error:
@@ -560,10 +653,11 @@ def main():
     parser.add_argument('--output', default='youtube_subtitles')
     parser.add_argument('--mode', choices=('auto', 'subtitles', 'whisper'), default='auto')
     parser.add_argument('--model', choices=('auto', 'small', 'medium', 'turbo', 'large-v3'), default='auto')
+    parser.add_argument('--stream-ended', action='store_true', help='Bestätigt: Der Livestream ist bereits beendet')
     args = parser.parse_args()
     try:
         result = run(args.url, local_file=args.local_file, output_dir=args.output,
-                     mode=args.mode, model_name=args.model)
+                     mode=args.mode, model_name=args.model, stream_ended=args.stream_ended)
         print(f'Fertig: {result.archive}')
     except SubtitleError as error:
         parser.exit(1, f'{error}\n')

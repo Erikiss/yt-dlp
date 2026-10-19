@@ -130,7 +130,7 @@ def _show_result(result):
 def _start_colab():
     from google.colab import files
 
-    print('Untertitel-Tool · Version 1.1', flush=True)
+    print('Untertitel-Tool · Version 1.2', flush=True)
     if not Datei_hochladen:
         youtube_url(YouTube_Link)  # Fail before installing anything for an empty link.
         _setup_ytdlp()
@@ -155,8 +155,10 @@ def _start_colab():
         finally:
             os.chdir(previous_directory)
     mode = {'Automatisch': 'auto', 'Nur vorhandene Untertitel': 'subtitles', 'KI neu erzeugen': 'whisper'}[Modus]
+    if mode != 'subtitles':
+        _setup_ffmpeg()  # Also needed to check the duration of a fresh recording.
     result = run(YouTube_Link, local_file=local_file, output_dir=output, mode=mode,
-                 model_name=Whisper_Modell, transcriber=_colab_transcriber,
+                 model_name=Whisper_Modell, stream_ended=Stream_bereits_beendet, transcriber=_colab_transcriber,
                  progress=lambda message: print(message, flush=True))
     _show_result(result)
 
