@@ -106,29 +106,58 @@ class TestWorkflow(unittest.TestCase):
     def test_captions_workflow_does_not_load_whisper(self):
         raw = json.dumps({'events': [{'tStartMs': 45000000, 'dDurationMs': 2000, 'segs': [{'utf8': 'The end.'}]}]})
         FakeYDL.info['subtitles'] = {'en': [{'ext': 'json3', 'data': raw}]}
-        with tempfile.TemporaryDirectory() as temporary, patch('yt_dlp.YoutubeDL', FakeYDL):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(app, 'youtube_downloader', FakeYDL):
             result = app.run('QRS8MkLhQmM', output_dir=temporary, progress=lambda _: None,
                              transcriber=lambda *args, **kwargs: self.fail('Unexpected Whisper'))
             self.assertEqual((result.directory / 'original.json3').read_text(), raw)
             self.assertIn('12:30:00,000', (result.directory / 'untertitel.srt').read_text())
 
     def test_absent_captions_in_captions_only_mode_is_clear(self):
-        with tempfile.TemporaryDirectory() as temporary, patch('yt_dlp.YoutubeDL', FakeYDL):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(app, 'youtube_downloader', FakeYDL):
             with self.assertRaisesRegex(app.SubtitleError, 'Keine vorhandenen'):
                 app.run('QRS8MkLhQmM', mode='subtitles', output_dir=temporary, progress=lambda _: None)
 
     def test_blocked_cloud_is_not_misreported_as_no_captions(self):
         FakeYDL.failure = RuntimeError('HTTP Error 429: Too Many Requests')
-        with tempfile.TemporaryDirectory() as temporary, patch('yt_dlp.YoutubeDL', FakeYDL):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(app, 'youtube_downloader', FakeYDL):
             with self.assertRaisesRegex(app.SubtitleError, 'kein fehlender Untertitel'):
                 app.run('QRS8MkLhQmM', output_dir=temporary, progress=lambda _: None,
                         transcriber=lambda *args, **kwargs: self.fail('Unexpected Whisper'))
 
     def test_live_stream_rejected(self):
         FakeYDL.info['is_live'] = True
-        with tempfile.TemporaryDirectory() as temporary, patch('yt_dlp.YoutubeDL', FakeYDL):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(app, 'youtube_downloader', FakeYDL):
             with self.assertRaisesRegex(app.SubtitleError, 'Livestreams'):
                 app.run('QRS8MkLhQmM', output_dir=temporary, progress=lambda _: None)
+
+
+class TestRealYoutubeExtractor(unittest.TestCase):
+    def test_missing_duration_does_not_crash_and_patch_is_instance_local(self):
+        from yt_dlp import YoutubeDL
+
+        response = [{'storyboards': {'playerStoryboardSpecRenderer': {
+            'spec': 'https://i.ytimg.com/sb/test/storyboard3_L$L/$N.jpg?x=1|48#27#100#10#10#0#default#signature',
+        }}}]
+        with app.youtube_downloader(app.ydl_options()) as ydl:
+            extractor = ydl.get_info_extractor('Youtube')
+            for duration in (None, 0, 60):
+                self.assertEqual(list(extractor._extract_storyboard(response, duration)), [])
+            self.assertEqual(ydl._ies['Youtube'], extractor)
+        # The standard extractor outside this tool has not been monkeypatched.
+        with YoutubeDL({'quiet': True}) as plain:
+            self.assertEqual(len(list(plain.get_info_extractor('Youtube')._extract_storyboard(response, 60))), 1)
+
+    def test_access_denial_not_suppressed_by_metadata_mode(self):
+        from yt_dlp.utils import ExtractorError
+
+        with app.youtube_downloader({**app.ydl_options(), 'ignore_no_formats_error': True}) as ydl:
+            extractor = ydl.get_info_extractor('Youtube')
+            for message in ('Sign in to confirm you are not a bot', 'Private video',
+                            'The current session has been rate-limited by YouTube'):
+                with self.subTest(message=message), self.assertRaises(ExtractorError):
+                    extractor.raise_no_formats(message, expected=True)
+            # No media formats alone must still permit available subtitle metadata.
+            self.assertIsNone(extractor.raise_no_formats('No video formats found', expected=True))
 
 
 class FakeWhisper:

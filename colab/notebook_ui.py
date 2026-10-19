@@ -130,6 +130,7 @@ def _show_result(result):
 def _start_colab():
     from google.colab import files
 
+    print('Untertitel-Tool · Version 1.1', flush=True)
     if not Datei_hochladen:
         youtube_url(YouTube_Link)  # Fail before installing anything for an empty link.
         _setup_ytdlp()
@@ -160,12 +161,21 @@ def _start_colab():
     _show_result(result)
 
 
+def _show_error(message):
+    # Colab's plain preformatted output can be clipped on a narrow phone screen.
+    from IPython.display import HTML, display
+
+    display(HTML('<div role="alert" style="white-space:pre-wrap;overflow-wrap:anywhere;'
+                 'padding:14px;border:1px solid #b45309;border-radius:9px;'
+                 'font:15px/1.5 sans-serif">' + html.escape(message) + '</div>'))
+
+
 try:
     _start_colab()
 except SubtitleError as error:
-    print(f'\nHinweis: {error}', flush=True)
+    _show_error(f'Hinweis: {error}')
 except KeyboardInterrupt:
     print('\nGestoppt. Bereits gesicherte Abschnitte bleiben erhalten. Zum Fortsetzen dieselben Einstellungen nutzen.')
 except Exception as error:
-    print(f'\nDer Lauf konnte nicht abgeschlossen werden: {type(error).__name__}: {error}', flush=True)
-    print('Es wurde kein vollständiges Ergebnis bestätigt. Gesicherte .partial-Dateien bleiben erhalten.')
+    _show_error(f'Der Lauf konnte nicht abgeschlossen werden: {type(error).__name__}: {error}\n'
+                'Es wurde kein vollständiges Ergebnis bestätigt. Gesicherte .partial-Dateien bleiben erhalten.')

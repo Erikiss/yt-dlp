@@ -254,7 +254,8 @@ def caption_track(info: dict) -> tuple[str, str, list[dict]] | None:
 def youtube_error(error: Exception) -> SubtitleError:
     message = str(error)
     lowered = message.lower()
-    if any(marker in lowered for marker in ('429', '403', 'bot', 'sign in', 'login', 'po token', 'age-restrict')):
+    if any(marker in lowered for marker in ('429', '403', 'bot', 'sign in', 'login', 'po token',
+                                            'age-restrict', 'captcha', 'rate-limit', 'too many requests')):
         return SubtitleError(
             'YouTube lässt den Abruf aus dieser Umgebung nicht zu (Anmeldung, Zugriffsschutz oder Anfragegrenze). '
             'Das ist kein fehlender Untertitel. Später erneut versuchen oder eine eigene Audio-/Videodatei '
@@ -277,6 +278,40 @@ class QuietLogger:
 
     def error(self, message):
         pass
+
+
+def youtube_downloader(options: dict):
+    """Use the pinned extractor without irrelevant storyboard processing.
+
+    Its storyboard implementation divides a missing duration by a float. The
+    subtitle workflow does not consume thumbnail/storyboard formats at all.
+    Keep the change local to this downloader instance, including after reruns.
+    """
+    from yt_dlp import YoutubeDL
+    from yt_dlp.extractor.youtube import YoutubeIE
+    from yt_dlp.utils import ExtractorError
+
+    class SubtitleYoutubeIE(YoutubeIE):
+        @classmethod
+        def ie_key(cls):
+            return YoutubeIE.ie_key()
+
+        def _extract_storyboard(self, player_responses, duration):
+            return iter(())
+
+        def raise_no_formats(self, msg, expected=False, video_id=None):
+            # Metadata-only extraction may allow missing media formats, but
+            # must not suppress an explicit denial and mislabel it as no subs.
+            markers = ('sign in', 'sign-in', 'log in', 'login', 'not a bot', 'captcha',
+                       'age-restrict', 'private', 'unavailable', 'not available',
+                       'removed', 'rate-limit', 'too many requests', '403', '429', 'po token')
+            if any(marker in str(msg).lower() for marker in markers):
+                raise ExtractorError(str(msg), expected=expected, video_id=video_id)
+            return super().raise_no_formats(msg, expected=expected, video_id=video_id)
+
+    ydl = YoutubeDL(options)
+    ydl.add_info_extractor(SubtitleYoutubeIE(ydl))
+    return ydl
 
 
 def ydl_options() -> dict:
@@ -472,11 +507,9 @@ def run(url: str = '', *, output_dir: str | Path = 'youtube_subtitles',
         root = output_dir / f'lokal-{file_digest(audio)[:16]}'
     else:
         canonical = youtube_url(url)
-        from yt_dlp import YoutubeDL
-
         progress('Prüfe Video und verfügbare Untertitel …')
         try:
-            with YoutubeDL({**ydl_options(), 'skip_download': True, 'ignore_no_formats_error': True}) as ydl:
+            with youtube_downloader({**ydl_options(), 'skip_download': True, 'ignore_no_formats_error': True}) as ydl:
                 info = ydl.extract_info(canonical, download=False)
                 if not info or info.get('_type') in ('playlist', 'multi_video'):
                     raise SubtitleError('Kein einzelnes Video gefunden.')
@@ -507,8 +540,8 @@ def run(url: str = '', *, output_dir: str | Path = 'youtube_subtitles',
         cache = output_dir / '_audio' / video_id
         cache.mkdir(parents=True, exist_ok=True)
         try:
-            with YoutubeDL({**ydl_options(), 'format': 'bestaudio/best',
-                            'outtmpl': str(cache / 'audio.%(ext)s')}) as ydl:
+            with youtube_downloader({**ydl_options(), 'format': 'bestaudio/best',
+                                     'outtmpl': str(cache / 'audio.%(ext)s')}) as ydl:
                 audio_info = ydl.extract_info(canonical, download=True)
                 audio = Path(ydl.prepare_filename(audio_info))
                 if not audio.is_file():

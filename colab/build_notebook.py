@@ -25,6 +25,8 @@ ZIP_automatisch_herunterladen = True #@param {type:"boolean"}
 source = form + f'_SUBTITLE_CORE = {core!r}\nexec(compile(_SUBTITLE_CORE, "subtitle_tool.py", "exec"))\n\n' + ui
 intro = '''# YouTube → Untertitel & Transkript
 
+**Version 1.1** · Korrektur für fehlende Videolänge und bessere Fehlermeldungen auf dem Handy.
+
 **Link einfügen. ▶ drücken. Dateien herunterladen.** Funktioniert im Browser auf Handy, Tablet und PC.
 
 1. Im Feld **YouTube_Link** den Videolink einfügen.

@@ -2,6 +2,8 @@
 
 [![In Colab öffnen](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Erikiss/yt-dlp/blob/subtitle-colab/colab/YouTube_Untertitel.ipynb)
 
+**Version 1.1:** Behebt den gemeldeten Fehler `unsupported operand type(s) for /: 'NoneType' and 'float'`. yt-dlp berechnete Vorschaubild-Zeitangaben trotz fehlender Videolänge. Der Untertitel-Einstieg überspringt diese unbenötigten Storyboards in einer eigenen Extractor-Instanz. Explizite YouTube-Anmelde-/Zugriffsfehler werden auch im Metadatenmodus nicht mehr unterdrückt; Fehlermeldungen werden auf kleinen Bildschirmen umgebrochen. Die Sicherungen vorhandener Transkriptionsläufe bleiben kompatibel.
+
 ## Sofort starten
 
 1. **In Colab öffnen** anklicken; falls nötig bei Google anmelden.
