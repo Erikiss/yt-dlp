@@ -1,4 +1,10 @@
 <!-- MANPAGE: BEGIN EXCLUDED SECTION -->
+## YouTube-Untertitel mit einem Link
+
+Persönlicher Colab-Einstieg für diesen Fork: Link einfügen, ▶ starten, SRT/VTT/TXT herunterladen.
+
+[![In Colab öffnen](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Erikiss/yt-dlp/blob/subtitle-colab/colab/YouTube_Untertitel.ipynb) · [Anleitung](colab/README.md)
+
 <div align="center">
 
 [![YT-DLP](https://raw.githubusercontent.com/yt-dlp/yt-dlp/master/.github/banner.svg)](#readme)
