@@ -27,7 +27,7 @@ ZIP_automatisch_herunterladen = True #@param {type:"boolean"}
 source = form + f'_SUBTITLE_CORE = {core!r}\nexec(compile(_SUBTITLE_CORE, "subtitle_tool.py", "exec"))\n\n' + ui
 intro = '''# YouTube → Untertitel & Transkript
 
-**Version 1.2** · Beendete Livestreams werden als Aufzeichnungen behandelt. Bei veraltetem Live-Status **Stream_bereits_beendet** anhaken.
+**Version 1.3** · Zwei Abrufwege für vorhandene Untertitel: zuerst direkt, dann mit yt-dlp. Fehler zeigen jetzt die genaue Ursache je Abrufweg. Bei veraltetem Live-Status **Stream_bereits_beendet** anhaken.
 
 **Link einfügen. ▶ drücken. Dateien herunterladen.** Funktioniert im Browser auf Handy, Tablet und PC.
 
@@ -35,13 +35,13 @@ intro = '''# YouTube → Untertitel & Transkript
 2. Links neben der Zelle **▶** drücken. Beim ersten Start gegebenenfalls mit Google anmelden und „Trotzdem ausführen“ bestätigen.
 3. Anschließend **ZIP, SRT, VTT oder TXT** herunterladen. Für das nächste Video Link austauschen und erneut ▶ drücken.
 
-**Standard:** vorhandene Untertitel in der Originalsprache bevorzugen; falls keine vorhanden sind, Sprache mit Whisper erkennen. Kein API-Key. Für vorhandene Untertitel reicht die normale CPU-Laufzeit.
+**Standard:** vorhandene Untertitel zuerst mit `youtube-transcript-api`, danach bei Bedarf mit yt-dlp abrufen. Die Originalsprache wird bevorzugt; falls sie nicht ermittelbar ist, wird das gekennzeichnet. Falls kein Untertitelabruf gelingt und die Tonspur zugänglich ist, Sprache mit Whisper erkennen. Kein API-Key. Für vorhandene Untertitel reicht die normale CPU-Laufzeit.
 
 **Gerade beendeter Stream:** Der `/live/`-Link bleibt gültig. Wenn YouTube weiterhin „live“ meldet, **Stream_bereits_beendet** aktivieren. Das Tool versucht vorhandene Untertitel und eine fertige Audiodatei abzurufen. YouTube kann die Aufzeichnung und die neuen automatischen Untertitel noch verarbeiten; dann meldet das Tool das gesondert. Es startet keine dauerhafte Liveaufnahme und gibt keinen erkennbar unvollständigen Audioausschnitt als ganzes Video aus.
 
 **Sehr lange Videos ohne Untertitel:** vor dem Start bei Bedarf **Laufzeit → Laufzeittyp ändern → T4 GPU** wählen; eine A100 ist nicht erforderlich. Für dauerhafte Zwischenstände **In_Google_Drive_sichern** anhaken. Whisper verarbeitet 10-Minuten-Abschnitte und sichert nach jedem fertigen Abschnitt. Dieselbe Datei/Link und dieselbe Modellwahl setzen den Lauf fort. Ohne Drive bleiben Sicherungen nur bis zum Löschen der Laufzeit erhalten. Colab kann Sitzungen beenden; eine unbegrenzte Laufzeit wird nicht zugesichert.
 
-**YouTube kann Cloud-Zugriffe blockieren.** Dann erklärt das Notebook den Fehler. Alternativ **Datei_hochladen** wählen und eine eigene Audio-/Videodatei verwenden. Das benötigt keinen YouTube-Zugriff.
+**Falls der Abruf scheitert:** Unter „Technische Details“ stehen die Ergebnisse beider Abrufwege, etwa eine Anfragegrenze, eine Anmeldeanforderung oder ein Verbindungsfehler. Eine solche Meldung bedeutet nicht, dass das Video keine Untertitel hat. Für eine gezielte Fehleranalyse bitte diese Details mitkopieren. Alternativ **Datei_hochladen** wählen und eine eigene Audio-/Videodatei verwenden.
 
 Die Ausgabe ist vollständig und wird nicht zusammengefasst. `transkript.txt` ist zum Lesen und für ChatGPT; `untertitel.srt`/`.vtt` enthalten Zeitangaben. KI-Ergebnisse können Erkennungsfehler enthalten. Kein künstliches Limit für die Videolänge; Laufzeit, Speicher und YouTube-Zugriff bleiben praktische Grenzen.
 

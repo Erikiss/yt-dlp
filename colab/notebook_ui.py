@@ -18,16 +18,18 @@ def _install(*packages):
 
 
 def _setup_ytdlp():
-    global _subtitle_setup_sha
+    global _subtitle_setup_version
     commit = '897341241f2bfb2439fe0367f4c7c9ccd29a3828'
-    if globals().get('_subtitle_setup_sha') != commit:
-        print('Einmalige Einrichtung dieser Sitzung: yt-dlp aus deinem Repo …', flush=True)
-        _install(f'yt-dlp[default,deno] @ git+https://github.com/Erikiss/yt-dlp.git@{commit}')
+    version = (commit, '1.2.4', '1.3')
+    if globals().get('_subtitle_setup_version') != version:
+        print('Einmalige Einrichtung: direkter Untertitelabruf und yt-dlp aus deinem Repo …', flush=True)
+        _install('youtube-transcript-api==1.2.4',
+                 f'yt-dlp[default,deno] @ git+https://github.com/Erikiss/yt-dlp.git@{commit}')
         # The notebook may have previously imported another yt-dlp release.
         for name in list(sys.modules):
-            if name == 'yt_dlp' or name.startswith('yt_dlp.'):
+            if name in ('yt_dlp', 'youtube_transcript_api') or name.startswith(('yt_dlp.', 'youtube_transcript_api.')):
                 del sys.modules[name]
-        _subtitle_setup_sha = commit
+        _subtitle_setup_version = version
 
 
 def _setup_ffmpeg():
@@ -130,7 +132,7 @@ def _show_result(result):
 def _start_colab():
     from google.colab import files
 
-    print('Untertitel-Tool · Version 1.2', flush=True)
+    print('Untertitel-Tool · Version 1.3', flush=True)
     if not Datei_hochladen:
         youtube_url(YouTube_Link)  # Fail before installing anything for an empty link.
         _setup_ytdlp()
@@ -163,19 +165,22 @@ def _start_colab():
     _show_result(result)
 
 
-def _show_error(message):
+def _show_error(message, details=''):
     # Colab's plain preformatted output can be clipped on a narrow phone screen.
     from IPython.display import HTML, display
 
+    diagnostic = ('<details open style="margin-top:12px"><summary>Technische Details – bei Rückfragen mitkopieren</summary>'
+                  '<pre style="white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.5 monospace">'
+                  + html.escape(details) + '</pre></details>') if details else ''
     display(HTML('<div role="alert" style="white-space:pre-wrap;overflow-wrap:anywhere;'
                  'padding:14px;border:1px solid #b45309;border-radius:9px;'
-                 'font:15px/1.5 sans-serif">' + html.escape(message) + '</div>'))
+                 'font:15px/1.5 sans-serif">' + html.escape(message) + diagnostic + '</div>'))
 
 
 try:
     _start_colab()
 except SubtitleError as error:
-    _show_error(f'Hinweis: {error}')
+    _show_error(f'Hinweis: {error}', error.details)
 except KeyboardInterrupt:
     print('\nGestoppt. Bereits gesicherte Abschnitte bleiben erhalten. Zum Fortsetzen dieselben Einstellungen nutzen.')
 except Exception as error:

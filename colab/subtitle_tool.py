@@ -20,6 +20,7 @@ import textwrap
 import time
 import zipfile
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -31,6 +32,10 @@ CONTEXT_SECONDS = 3
 
 class SubtitleError(RuntimeError):
     """An actionable, user-facing failure."""
+
+    def __init__(self, message, *, details=''):
+        super().__init__(message)
+        self.details = details
 
 
 @dataclass
@@ -253,18 +258,120 @@ def caption_track(info: dict) -> tuple[str, str, list[dict]] | None:
     return None
 
 
+def error_detail(error: Exception) -> str:
+    """Keep the error type/reason, but never put signed URLs or tokens in reports."""
+    text = getattr(error, 'details', '') or f'{type(error).__name__}: {error}'
+    text = re.sub(r'\x1b\[[0-9;]*m', '', text)
+    text = re.sub(r'https?://[^\s<>"\']+',
+                  lambda match: urlparse(match[0])._replace(query='', fragment='', netloc=urlparse(match[0]).hostname or '').geturl(), text)
+    text = re.sub(r'(?i)\b(cookie|authorization|po_token|pot|token|api_key)\s*[:=]\s*[^\s,;]+', r'\1=[entfernt]', text)
+    return text[:1600]
+
+
 def youtube_error(error: Exception) -> SubtitleError:
-    message = str(error)
-    lowered = message.lower()
-    if any(marker in lowered for marker in ('429', '403', 'bot', 'sign in', 'login', 'po token',
-                                            'age-restrict', 'captcha', 'rate-limit', 'too many requests')):
-        return SubtitleError(
-            'YouTube lässt den Abruf aus dieser Umgebung nicht zu (Anmeldung, Zugriffsschutz oder Anfragegrenze). '
-            'Das ist kein fehlender Untertitel. Später erneut versuchen oder eine eigene Audio-/Videodatei '
-            'über „Datei hochladen“ transkribieren. Es werden keine Zugangssperren umgangen.')
-    if any(marker in lowered for marker in ('private', 'unavailable', 'not available', 'removed')):
-        return SubtitleError('Das Video ist privat, gelöscht oder hier nicht verfügbar. Bitte den Link prüfen.')
-    return SubtitleError(f'Abruf fehlgeschlagen: {message[:600]}')
+    if isinstance(error, SubtitleError):
+        return error
+    detail = error_detail(error)
+    lowered = detail.lower()
+    if any(marker in lowered for marker in ('http error 429', '429 client error', 'rate-limit', 'too many requests')):
+        message = 'YouTube meldet für diesen Abruf eine Anfragegrenze (429/Rate-Limit). Bitte später erneut versuchen.'
+    elif any(marker in lowered for marker in ('requestblocked', 'ipblocked', 'not a bot', 'sign in', 'sign-in', 'captcha')):
+        message = ('YouTube verlangt bei diesem Abruf eine Anmeldung oder Botbestätigung. '
+                   'Das sagt nichts darüber aus, ob Untertitel vorhanden sind. Ein anderes Tool kann einen anderen Abrufweg verwenden.')
+    elif any(marker in lowered for marker in ('http error 403', '403 client error', '403 forbidden')):
+        message = 'YouTube lehnt diesen Abruf mit HTTP 403 ab. Die genaue Ursache steht unter „Technische Details“.'
+    elif 'po token' in lowered or 'po_token' in lowered:
+        message = 'Für diesen Abrufweg fehlt ein von YouTube verlangter PO-Token. Details stehen unten.'
+    elif 'ssl' in lowered or 'certificate_verify_failed' in lowered:
+        message = 'Die sichere Verbindung zu YouTube ist fehlgeschlagen (TLS/Zertifikat). Das ist kein Nachweis fehlender Untertitel.'
+    elif any(marker in lowered for marker in ('transcriptsdisabled', 'notranscriptfound')):
+        message = 'Über diesen Abrufweg wurden keine verfügbaren Untertitel gemeldet.'
+    elif any(marker in lowered for marker in ('age-restrict', 'agerestricted', 'private', 'unavailable', 'not available', 'removed')):
+        message = 'YouTube meldet das Video für diesen Abruf als eingeschränkt oder nicht verfügbar. Die genaue Meldung steht unten.'
+    else:
+        message = f'Abruf fehlgeschlagen: {detail[:500]}'
+    return SubtitleError(message, details=detail)
+
+
+def combined_error(attempts: list[tuple[str, Exception]]) -> SubtitleError:
+    last_error = youtube_error(attempts[-1][1])
+    return SubtitleError(str(last_error), details='\n\n'.join(
+        f'{name}:\n{error_detail(error)}' for name, error in attempts))
+
+
+def player_metadata(payload: dict) -> dict:
+    """Read metadata from the transcript client's existing player response."""
+    details = payload.get('videoDetails') or {}
+    microformat = (payload.get('microformat') or {}).get('playerMicroformatRenderer') or {}
+    broadcast = microformat.get('liveBroadcastDetails') or {}
+    ended = False
+    try:
+        ended = datetime.fromisoformat(broadcast['endTimestamp'].replace('Z', '+00:00')).timestamp() <= time.time()
+    except (KeyError, TypeError, ValueError):
+        pass
+    live = details.get('isLive', broadcast.get('isLiveNow', False))
+    status = ('post_live' if details.get('isPostLiveDvr') else 'was_live' if ended
+              else 'is_live' if live else 'is_upcoming' if details.get('isUpcoming')
+              else 'was_live' if details.get('isLiveContent') else 'not_live')
+    try:
+        duration = float(details.get('lengthSeconds') or microformat.get('lengthSeconds') or 0) or None
+    except (TypeError, ValueError):
+        duration = None
+    return {'title': details.get('title'), 'duration_seconds': duration,
+            'language': details.get('defaultAudioLanguage'), 'live_status': status}
+
+
+def fetch_direct_transcript(canonical: str, root: Path, *, stream_ended=False, progress=print) -> Result:
+    """Try the maintained transcript client before extracting any media formats."""
+    from requests import Session
+    from youtube_transcript_api import YouTubeTranscriptApi
+
+    video_id = parse_qs(urlparse(canonical).query)['v'][0]
+
+    class TranscriptSession(Session):
+        def __init__(self):
+            super().__init__()
+            self.video_info = {}
+
+        def request(self, *args, **kwargs):
+            kwargs.setdefault('timeout', (10, 30))
+            response = super().request(*args, **kwargs)
+            if response.status_code == 200 and urlparse(response.url).path == '/youtubei/v1/player':
+                self.video_info = player_metadata(response.json())
+            return response
+
+    with TranscriptSession() as session:
+        transcripts = list(YouTubeTranscriptApi(http_client=session).list(video_id))
+        info = session.video_info
+        if info.get('live_status') in ('is_live', 'is_upcoming') and not stream_ended:
+            raise SubtitleError('YouTube meldet dieses Video noch als live. '
+                                'Falls es bereits beendet ist, „Stream_bereits_beendet“ anhaken.')
+        if not transcripts:
+            raise SubtitleError('Der direkte Abruf hat keine Untertitelspur geliefert.')
+        generated = [track for track in transcripts if track.is_generated]
+        language = info.get('language') or (generated[0].language_code if len(generated) == 1 else None)
+        same_language = [track for track in transcripts if track.language_code == language]
+        if language and not same_language:
+            same_language = [track for track in transcripts if track.language_code.split('-')[0] == language.split('-')[0]]
+        selected = next((track for track in same_language if not track.is_generated), None)
+        selected = selected or next(iter(same_language), None) or transcripts[0]
+        source = 'YouTube-Autountertitel' if selected.is_generated else 'YouTube-Untertitel'
+        if not same_language:
+            source += ' (Originalsprache nicht ermittelbar)'
+        progress(f'Lade {source}, Sprache: {selected.language_code}. Dafür wird keine GPU benötigt.')
+        fetched = selected.fetch()
+        raw_data = fetched.to_raw_data()
+    cues = normalize_cues([Cue(float(item['start']), float(item['start']) + float(item['duration']), item['text'])
+                           for item in raw_data])
+    if not cues:
+        raise SubtitleError('Der direkte Abruf hat eine leere Untertitelspur geliefert.')
+    directory = root / 'youtube'
+    raw_path = directory / 'original.transcript-api.json'
+    atomic_text(raw_path, json.dumps(raw_data, ensure_ascii=False, indent=2))
+    metadata = {**info, 'title': info.get('title') or video_id, 'url': canonical, 'video_id': video_id,
+                'source': source, 'language': selected.language_code, 'backend': 'youtube-transcript-api',
+                'stream_ended_confirmed': stream_ended, 'reported_live_status': info.get('live_status')}
+    return make_result(directory, cues, metadata, raw_path)
 
 
 def is_ended_recording(info: dict) -> bool:
@@ -319,7 +426,7 @@ def youtube_downloader(options: dict):
     """
     from yt_dlp import YoutubeDL
     from yt_dlp.extractor.youtube import YoutubeIE
-    from yt_dlp.utils import ExtractorError, parse_iso8601
+    from yt_dlp.utils import parse_iso8601
 
     class SubtitleYoutubeIE(YoutubeIE):
         @classmethod
@@ -351,21 +458,23 @@ def youtube_downloader(options: dict):
                                          player_responses, player_url, duration)
 
         def raise_no_formats(self, msg, expected=False, video_id=None):
-            # Metadata-only extraction may allow missing media formats, but
-            # must not suppress an explicit denial and mislabel it as no subs.
+            # Video playback can fail while a caption track is still returned.
+            # Keep the player failure for a report if no captions can be fetched,
+            # but let upstream finish its metadata/subtitle extraction first.
             markers = ('sign in', 'sign-in', 'log in', 'login', 'not a bot', 'captcha',
                        'age-restrict', 'private', 'unavailable', 'not available',
                        'removed', 'rate-limit', 'too many requests', '403', '429', 'po token')
-            if any(marker in str(msg).lower() for marker in markers):
-                raise ExtractorError(str(msg), expected=expected, video_id=video_id)
+            if expected and self.get_param('ignore_no_formats_error') and any(marker in str(msg).lower() for marker in markers):
+                self._downloader.subtitle_playback_errors.append(str(msg))
             return super().raise_no_formats(msg, expected=expected, video_id=video_id)
 
     ydl = YoutubeDL(options)
+    ydl.subtitle_playback_errors = []
     ydl.add_info_extractor(SubtitleYoutubeIE(ydl))
     return ydl
 
 
-def ydl_options() -> dict:
+def ydl_options(*, metadata_only=False) -> dict:
     runtime = {}
     if not shutil.which('deno'):
         try:
@@ -382,7 +491,7 @@ def ydl_options() -> dict:
         'retries': 3,
         'fragment_retries': 3,
         'extractor_retries': 2,
-        'extractor_args': {'youtube': {'skip': ['translated_subs']}},
+        'extractor_args': {'youtube': {'skip': ['translated_subs', *(['hls', 'dash'] if metadata_only else [])]}},
         'js_runtimes': {'deno': runtime},
     }
 
@@ -558,9 +667,20 @@ def run(url: str = '', *, output_dir: str | Path = 'youtube_subtitles',
         root = output_dir / f'lokal-{file_digest(audio)[:16]}'
     else:
         canonical = youtube_url(url)
-        progress('Prüfe Video und verfügbare Untertitel …')
+        video_id = parse_qs(urlparse(canonical).query)['v'][0]
+        root = output_dir / video_id
+        attempts = []
+        if mode != 'whisper':
+            progress('Prüfe Untertitel direkt …')
+            try:
+                return fetch_direct_transcript(canonical, root, stream_ended=stream_ended, progress=progress)
+            except Exception as error:
+                attempts.append(('Direkter Untertitelabruf', error))
+                progress(f'Direkter Abruf ohne Ergebnis ({type(error).__name__}). Prüfe zusätzlich mit yt-dlp …')
+        else:
+            progress('Prüfe Video für Spracherkennung …')
         try:
-            with youtube_downloader({**ydl_options(), 'skip_download': True, 'ignore_no_formats_error': True}) as ydl:
+            with youtube_downloader({**ydl_options(metadata_only=True), 'skip_download': True, 'ignore_no_formats_error': True}) as ydl:
                 info = ydl.extract_info(canonical, download=False)
                 if not info or info.get('_type') in ('playlist', 'multi_video'):
                     raise SubtitleError('Kein einzelnes Video gefunden.')
@@ -572,8 +692,6 @@ def run(url: str = '', *, output_dir: str | Path = 'youtube_subtitles',
                         'Falls der Stream bereits beendet ist: „Stream_bereits_beendet“ anhaken und erneut starten. '
                         'Der /live/-Link ist auch für Aufzeichnungen gültig.')
                 cautious_recording = info.get('live_status') == 'post_live' or bool(reports_live and (ended or stream_ended))
-                video_id = parse_qs(urlparse(canonical).query)['v'][0]
-                root = output_dir / video_id
                 metadata = {'title': info.get('title') or video_id, 'url': canonical,
                             'video_id': video_id, 'duration_seconds': info.get('duration'),
                             'reported_live_status': info.get('live_status'), 'stream_ended_confirmed': stream_ended}
@@ -584,21 +702,33 @@ def run(url: str = '', *, output_dir: str | Path = 'youtube_subtitles',
                 if mode != 'whisper' and track:
                     source, language, formats = track
                     progress(f'Lade {source}, Sprache: {language}. Dafür wird keine GPU benötigt.')
-                    cues, raw, extension = fetch_caption(ydl, formats)
-                    directory = root / 'youtube'
-                    raw_path = directory / f'original.{extension}'
-                    atomic_text(raw_path, raw)
-                    return make_result(directory, cues, {**metadata, 'source': source, 'language': language}, raw_path)
-        except SubtitleError:
-            raise
+                    try:
+                        cues, raw, extension = fetch_caption(ydl, formats)
+                    except Exception as error:
+                        attempts.append(('yt-dlp: Untertiteldatei', error))
+                        progress('Die Untertiteldatei konnte nicht geladen werden.')
+                    else:
+                        directory = root / 'youtube'
+                        raw_path = directory / f'original.{extension}'
+                        atomic_text(raw_path, raw)
+                        return make_result(directory, cues, {**metadata, 'source': source, 'language': language,
+                                                            'backend': 'yt-dlp'}, raw_path)
+                playback_errors = getattr(ydl, 'subtitle_playback_errors', [])
+                if playback_errors:
+                    raise RuntimeError('\n'.join(playback_errors))
         except Exception as error:
-            raise youtube_error(error) from error
+            attempts.append(('yt-dlp: Videometadaten', error))
+            raise combined_error(attempts) from error
         if mode == 'subtitles':
+            if track:
+                raise combined_error(attempts)
             if ended or stream_ended:
-                raise SubtitleError('Für diese Aufzeichnung sind noch keine Untertitel abrufbar. '
-                                    'YouTube erstellt automatische Untertitel nach einem Livestream neu. '
-                                    'Später erneut versuchen oder „Automatisch“ für die Tonspur wählen.')
-            raise SubtitleError('Keine vorhandenen Untertitel gefunden. Für Spracherkennung „Automatisch“ wählen.')
+                message = ('Für diese Aufzeichnung hat keiner der Abrufwege Untertitel geliefert. '
+                           'Sie können noch verarbeitet werden oder hier nicht abrufbar sein. '
+                           '„Automatisch“ versucht zusätzlich die Tonspur.')
+            else:
+                message = 'Keiner der Abrufwege hat vorhandene Untertitel geliefert. Für Spracherkennung „Automatisch“ wählen.'
+            raise SubtitleError(message, details=combined_error(attempts).details if attempts else '')
         progress('Lade nur die Tonspur für die Spracherkennung …')
         cache = output_dir / '_audio' / video_id
         cache.mkdir(parents=True, exist_ok=True)
@@ -639,10 +769,9 @@ def run(url: str = '', *, output_dir: str | Path = 'youtube_subtitles',
                         raise SubtitleError('Die geladene Tonspur ist deutlich kürzer als die Aufzeichnung. '
                                             'YouTube hat möglicherweise noch nicht alles bereitgestellt. '
                                             'Bitte später erneut starten; kein vollständiges Transkript erzeugt.')
-        except SubtitleError:
-            raise
         except Exception as error:
-            raise youtube_error(error) from error
+            attempts.append(('yt-dlp: Tonspur', error))
+            raise combined_error(attempts) from error
     return (transcriber or transcribe_audio)(audio, root, metadata, model_name=model_name, progress=progress)
 
 
@@ -660,7 +789,7 @@ def main():
                      mode=args.mode, model_name=args.model, stream_ended=args.stream_ended)
         print(f'Fertig: {result.archive}')
     except SubtitleError as error:
-        parser.exit(1, f'{error}\n')
+        parser.exit(1, f'{error}\n' + (f'\nTechnische Details:\n{error.details}\n' if error.details else ''))
     except KeyboardInterrupt:
         parser.exit(130, 'Gestoppt. Bereits gesicherte Abschnitte bleiben erhalten.\n')
 

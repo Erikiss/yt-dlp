@@ -2,6 +2,8 @@
 
 [![In Colab öffnen](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Erikiss/yt-dlp/blob/subtitle-colab/colab/YouTube_Untertitel.ipynb)
 
+**Version 1.3:** Vorhandene Untertitel werden zuerst über `youtube-transcript-api==1.2.4` angefragt. Dieser Weg benötigt keine Audio-/Videoformate und berücksichtigt die Originalsprache sowie den Live-Status aus derselben Playerantwort. Falls er scheitert, folgt yt-dlp. Ein Playerfehler beendet die Metadatensuche nicht mehr vor der Untertitelauswertung; wenn auch dort keine Untertitel abrufbar sind, bleibt der Playerfehler in der Diagnose erhalten. Im Metadatenlauf werden keine HLS-/DASH-Manifeste geladen. Fehler zeigen je Abrufweg den Typ und die tatsächliche Meldung; URL-Abfrageparameter werden entfernt. Zwei Abrufwege garantieren keinen Zugriff aus jeder Cloud-Umgebung. Der konkret gemeldete Videolink konnte hier bisher nicht erfolgreich als Transkript abgerufen werden.
+
 **Version 1.2:** Beendete Streams (`was_live`/`post_live`) haben Vorrang vor einem widersprüchlichen `is_live`-Flag. Ein Endzeitpunkt in den YouTube-Metadaten korrigiert veraltete Live-Angaben schon vor der Formatauswahl. Wenn YouTube trotzdem weiter „live“ meldet, kann man **Stream_bereits_beendet** bestätigen. Vorhandene Untertitel werden dann abgerufen. Für noch nicht fertig verarbeitete/so bestätigte Aufzeichnungen werden nur endliche HTTP(S)-Mediendateien mit bekannter Dateigröße für Whisper gewählt; rollende Manifest-Ausschnitte werden nicht als vollständige Aufzeichnung ausgegeben. Die verfügbare Tonspur wird bei bekannter Gesamtdauer auf deutliche Verkürzung geprüft. Ein zu kurzer Download wird als `audio.incomplete.*` abgelegt, damit ein neuer Versuch die fertige Tonspur erneut abrufen kann.
 
 **Version 1.1:** Behebt den gemeldeten Fehler `unsupported operand type(s) for /: 'NoneType' and 'float'`. yt-dlp berechnete Vorschaubild-Zeitangaben trotz fehlender Videolänge. Der Untertitel-Einstieg überspringt diese unbenötigten Storyboards in einer eigenen Extractor-Instanz. Explizite YouTube-Anmelde-/Zugriffsfehler werden auch im Metadatenmodus nicht mehr unterdrückt; Fehlermeldungen werden auf kleinen Bildschirmen umgebrochen. Die Sicherungen vorhandener Transkriptionsläufe bleiben kompatibel.
@@ -16,7 +18,7 @@ Keine Kommandozeile, kein API-Key und kein lokales Installieren nötig. Das Note
 
 ## Was passiert?
 
-- Vorhandene Untertitel in der Originalsprache werden bevorzugt; danach YouTube-Autountertitel. Wenn die Originalsprache nicht ermittelbar ist, wird die gewählte vorhandene Spur ausdrücklich bezeichnet.
+- Zuerst versucht `youtube-transcript-api` vorhandene Untertitel abzurufen. Bei einem Fehler oder einer leeren Spur folgt yt-dlp aus diesem Fork. Beide Wege bevorzugen manuelle Untertitel in der Originalsprache vor YouTube-Autountertiteln. Wenn die Originalsprache nicht ermittelbar ist, wird das ausdrücklich bezeichnet.
 - Fehlen Untertitel, lädt yt-dlp die Tonspur und Whisper erzeugt Untertitel. Falls eine Tonspur nicht einzeln verfügbar ist, kann der Download ein Video mit Ton enthalten.
 - Der Modus **Nur vorhandene Untertitel** verhindert jede KI-Transkription. **KI neu erzeugen** nutzt Whisper auch bei vorhandenen Untertiteln.
 - Vorhandene Untertitel benötigen keine GPU. Whisper nutzt bei `auto` **turbo auf GPU** und **small auf CPU**. Für lange Videos ist eine T4 sinnvoll; eine A100 ist nicht nötig. Die Laufzeit wird von diesem Notebook nicht automatisch umgestellt.
@@ -35,6 +37,7 @@ Kurz nach dem Ende können die fertige Tonspur oder automatische Untertitel noch
 | `transkript_zeitstempel.txt` | Vollständiger Text mit Zeitstempeln |
 | `info.json` | Titel, Herkunft, erkannte Sprache und Abschlussstatus |
 | `original.json3` / `original.vtt` | Unveränderte YouTube-Untertitel, wenn abgerufen |
+| `original.transcript-api.json` | Vom direkten Transkriptclient gelieferte Segmente, vor der Bereinigung |
 | `untertitel.zip` | Die fertigen Ausgabedateien zusammen |
 
 Rollende Wiederholungen werden beim Umwandeln nur für zeitlich überlappende Untertitelzeilen reduziert. Die unveränderten Originaldaten bleiben erhalten. Bei ungewöhnlichen YouTube-Spuren kann eine manuelle Nachbearbeitung sinnvoll sein.
@@ -51,7 +54,7 @@ Nach einem Abbruch dieselben Einstellungen, denselben Link bzw. dieselbe Datei u
 
 ## Wenn YouTube blockiert
 
-YouTube kann Zugriffe aus Rechenzentren mit 403, 429, Bot-/Anmeldeprüfungen oder PO-Token-Anforderungen blockieren. Auch mit korrektem Code ist daher kein Erfolg für jeden Link garantiert. Das Notebook meldet diesen Fall gesondert und gibt ihn nicht als „keine Untertitel“ aus. Es verwendet keine Proxys, Cookies oder Maßnahmen zum Umgehen von Zugriffssperren.
+YouTube kann Zugriffe aus Rechenzentren mit 403, 429, Bot-/Anmeldeprüfungen oder PO-Token-Anforderungen blockieren. Auch mit korrektem Code ist daher kein Erfolg für jeden Link garantiert. Unter **Technische Details** zeigt das Notebook die Fehler beider Abrufwege. Ein Videoplayerfehler allein sagt nicht, ob Untertitel abrufbar sind. Der direkte Transkriptclient dokumentiert selbst mögliche Cloud-IP-Blockaden ([Projekt-Dokumentation](https://github.com/jdepoix/youtube-transcript-api)). Es werden keine externen Bezahldienste oder Proxy-Abos eingerichtet.
 
 Alternativ **Datei_hochladen** anhaken und eine eigene Audio-/Videodatei wählen. Dann arbeitet Whisper unabhängig von YouTube. Für sehr große Dateien ist ein manueller Upload in Colabs Dateibereich bzw. eine bereits in Drive liegende Datei praktischer als der Formularupload, der die Datei zunächst im Speicher hält. Das portable Python-Skript unterstützt dafür `--file`.
 
@@ -63,6 +66,7 @@ Voraussetzungen: Python 3.10+, FFmpeg; für GPU-Whisper die passenden CUDA-12-/c
 
 ```bash
 python -m pip install 'yt-dlp[default,deno] @ git+https://github.com/Erikiss/yt-dlp.git@897341241f2bfb2439fe0367f4c7c9ccd29a3828'
+python -m pip install 'youtube-transcript-api==1.2.4'
 python colab/subtitle_tool.py 'https://www.youtube.com/watch?v=VIDEO_ID' --mode subtitles
 
 # Optional: Sprache erkennen
@@ -79,7 +83,7 @@ python -m unittest discover -s colab -p 'test_subtitle_tool.py' -v
 python colab/build_notebook.py
 ```
 
-Die 25 Offlineprüfungen decken URL-Validierung, Sprachwahl, rollende Wiederholungen, lange Transkripte, ZIP/SRT/TXT-Ausgaben, Zugriffsfehler und unterbrochene/fertiggestellte Whisper-Sicherungen ab. Für beendete Streams prüfen sie außerdem widersprüchliche Live-Angaben, vergangene/zukünftige Endzeiten im echten Extractor, die ausdrückliche Bestätigung, unvollständige Audioformate und zu kurze Downloads. Die Whisper-Prüfung simuliert das Modell; sie misst keine Erkennungsqualität und prüft keinen echten GPU-Lauf. Ein vollständiger Durchlauf in Google Colab muss mit einem tatsächlich zugänglichen Video erfolgen.
+Die 31 Offlineprüfungen decken URL-Validierung, Sprachwahl, rollende Wiederholungen, lange Transkripte, ZIP/SRT/TXT-Ausgaben, Zugriffsfehler und unterbrochene/fertiggestellte Whisper-Sicherungen ab. Für beendete Streams prüfen sie außerdem widersprüchliche Live-Angaben, vergangene/zukünftige Endzeiten im echten Extractor, die ausdrückliche Bestätigung, unvollständige Audioformate und zu kurze Downloads. Der echte Transkriptclient wird mit HTTP-Testantworten geprüft; dabei darf kein Medienabruf gestartet werden. Weitere Fälle prüfen abrufbare Untertitel trotz Playerfehler und die Diagnose beider fehlgeschlagener Wege. Die Whisper-Prüfung simuliert das Modell; sie misst keine Erkennungsqualität und prüft keinen echten GPU-Lauf. Ein vollständiger Durchlauf in Google Colab muss mit einem tatsächlich zugänglichen Video erfolgen.
 
 Primärdokumentation: [yt-dlp](https://github.com/yt-dlp/yt-dlp#readme), [YouTube-JavaScript-Runtime/EJS](https://github.com/yt-dlp/yt-dlp/wiki/EJS), [faster-whisper](https://github.com/SYSTRAN/faster-whisper), [Colab-FAQ](https://research.google.com/colaboratory/faq.html).
 

@@ -83,6 +83,7 @@ class TestInputAndCaptions(unittest.TestCase):
 class FakeYDL:
     info = {}
     failure = None
+    subtitle_playback_errors = []
 
     def __init__(self, options):
         self.options = options
@@ -102,7 +103,11 @@ class FakeYDL:
 class TestWorkflow(unittest.TestCase):
     def setUp(self):
         FakeYDL.failure = None
+        FakeYDL.subtitle_playback_errors = []
         FakeYDL.info = {'id': 'QRS8MkLhQmM', 'title': 'Fixture', 'language': 'en', 'duration': 50000}
+        direct = patch.object(app, 'fetch_direct_transcript', side_effect=app.SubtitleError('Direkter Abruf ohne Spur'))
+        direct.start()
+        self.addCleanup(direct.stop)
 
     def test_captions_workflow_does_not_load_whisper(self):
         raw = json.dumps({'events': [{'tStartMs': 45000000, 'dDurationMs': 2000, 'segs': [{'utf8': 'The end.'}]}]})
@@ -115,15 +120,17 @@ class TestWorkflow(unittest.TestCase):
 
     def test_absent_captions_in_captions_only_mode_is_clear(self):
         with tempfile.TemporaryDirectory() as temporary, patch.object(app, 'youtube_downloader', FakeYDL):
-            with self.assertRaisesRegex(app.SubtitleError, 'Keine vorhandenen'):
+            with self.assertRaisesRegex(app.SubtitleError, 'Keiner der Abrufwege'):
                 app.run('QRS8MkLhQmM', mode='subtitles', output_dir=temporary, progress=lambda _: None)
 
     def test_blocked_cloud_is_not_misreported_as_no_captions(self):
         FakeYDL.failure = RuntimeError('HTTP Error 429: Too Many Requests')
         with tempfile.TemporaryDirectory() as temporary, patch.object(app, 'youtube_downloader', FakeYDL):
-            with self.assertRaisesRegex(app.SubtitleError, 'kein fehlender Untertitel'):
+            with self.assertRaisesRegex(app.SubtitleError, 'Anfragegrenze') as caught:
                 app.run('QRS8MkLhQmM', output_dir=temporary, progress=lambda _: None,
                         transcriber=lambda *args, **kwargs: self.fail('Unexpected Whisper'))
+            self.assertIn('HTTP Error 429', caught.exception.details)
+            self.assertIn('Direkter Untertitelabruf', caught.exception.details)
 
     def test_live_stream_rejected(self):
         FakeYDL.info['is_live'] = True
@@ -149,8 +156,101 @@ class TestWorkflow(unittest.TestCase):
     def test_processing_archive_without_captions_has_specific_message(self):
         FakeYDL.info.update(live_status='post_live', is_live=False)
         with tempfile.TemporaryDirectory() as temporary, patch.object(app, 'youtube_downloader', FakeYDL):
-            with self.assertRaisesRegex(app.SubtitleError, 'Aufzeichnung.*keine Untertitel'):
+            with self.assertRaisesRegex(app.SubtitleError, 'Aufzeichnung.*keiner der Abrufwege'):
                 app.run('QRS8MkLhQmM', mode='subtitles', output_dir=temporary, progress=lambda _: None)
+
+    def test_player_denial_does_not_discard_usable_captions(self):
+        FakeYDL.subtitle_playback_errors = ['Sign in to confirm you are not a bot']
+        self.test_captions_workflow_does_not_load_whisper()
+
+    def test_player_denial_without_captions_is_reported_after_both_attempts(self):
+        FakeYDL.subtitle_playback_errors = ['Sign in to confirm you are not a bot']
+        with tempfile.TemporaryDirectory() as temporary, patch.object(app, 'youtube_downloader', FakeYDL):
+            with self.assertRaisesRegex(app.SubtitleError, 'Botbestätigung') as caught:
+                app.run('QRS8MkLhQmM', output_dir=temporary, progress=lambda _: None)
+            self.assertIn('Sign in to confirm', caught.exception.details)
+            self.assertIn('Direkter Untertitelabruf', caught.exception.details)
+
+
+class TestDirectTranscript(unittest.TestCase):
+    def setUp(self):
+        self.requested_urls = []
+        self.payload = {'playabilityStatus': {'status': 'OK'},
+                        'videoDetails': {'title': 'Direct fixture', 'lengthSeconds': '100000'},
+                        'captions': {'playerCaptionsTracklistRenderer': {'captionTracks': [
+                            {'languageCode': 'de', 'name': {'runs': [{'text': 'Deutsch'}]},
+                             'baseUrl': 'https://www.youtube.com/api/timedtext?lang=de'},
+                            {'languageCode': 'en', 'kind': 'asr', 'name': {'runs': [{'text': 'English'}]},
+                             'baseUrl': 'https://www.youtube.com/api/timedtext?lang=en'},
+                        ]}}}
+
+    def http_fixture(self, session, method, url, **kwargs):
+        from requests import Response
+
+        self.assertEqual(kwargs['timeout'], (10, 30))
+        self.requested_urls.append(url)
+        response = Response()
+        response.status_code, response.url, response.encoding = 200, url, 'utf-8'
+        if '/watch?' in url:
+            content = '<html>"INNERTUBE_API_KEY":"fixture-key"</html>'
+        elif '/youtubei/v1/player' in url:
+            content = json.dumps(self.payload)
+        elif '/api/timedtext?' in url:
+            content = '<transcript><text start="90000" dur="2">Final words.</text></transcript>'
+        else:
+            self.fail(f'Unexpected request: {url}')
+        response._content = content.encode('utf-8')
+        return response
+
+    def test_real_transcript_client_succeeds_without_media_extraction(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch('requests.sessions.Session.request', autospec=True, side_effect=self.http_fixture), \
+                patch.object(app, 'youtube_downloader', side_effect=AssertionError('Media extraction should not run')):
+            result = app.run('QRS8MkLhQmM', output_dir=temporary, progress=lambda _: None)
+            self.assertEqual(result.language, 'en', 'Original automatic track beats a manual translation')
+            self.assertEqual(result.title, 'Direct fixture')
+            self.assertIn('25:00:00,000', (result.directory / 'untertitel.srt').read_text())
+            self.assertEqual((result.directory / 'transkript.txt').read_text().strip(), 'Final words.')
+            self.assertTrue((result.directory / 'original.transcript-api.json').exists())
+            self.assertEqual(len(self.requested_urls), 3)
+
+    def test_direct_client_prefers_manual_track_in_original_language(self):
+        tracks = self.payload['captions']['playerCaptionsTracklistRenderer']['captionTracks']
+        tracks.append({'languageCode': 'en', 'name': {'runs': [{'text': 'English manual'}]},
+                       'baseUrl': 'https://www.youtube.com/api/timedtext?lang=en&manual=1'})
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch('requests.sessions.Session.request', autospec=True, side_effect=self.http_fixture):
+            result = app.fetch_direct_transcript('https://www.youtube.com/watch?v=QRS8MkLhQmM',
+                                               Path(temporary), progress=lambda _: None)
+            self.assertEqual(result.source, 'YouTube-Untertitel')
+            self.assertIn('manual=1', self.requested_urls[-1])
+
+    def test_direct_client_live_guard_and_end_confirmation(self):
+        self.payload['videoDetails']['isLive'] = True
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch('requests.sessions.Session.request', autospec=True, side_effect=self.http_fixture):
+            with self.assertRaisesRegex(app.SubtitleError, 'Stream_bereits_beendet'):
+                app.fetch_direct_transcript('https://www.youtube.com/watch?v=QRS8MkLhQmM',
+                                            Path(temporary), progress=lambda _: None)
+            result = app.fetch_direct_transcript('https://www.youtube.com/watch?v=QRS8MkLhQmM',
+                                               Path(temporary), stream_ended=True, progress=lambda _: None)
+            self.assertEqual(result.language, 'en')
+
+    def test_both_failures_remain_visible_and_sensitive_query_is_removed(self):
+        self.payload = {'playabilityStatus': {'status': 'LOGIN_REQUIRED',
+                                             'reason': "Sign in to confirm you’re not a bot"}}
+        FakeYDL.failure = RuntimeError('HTTP Error 429 https://example.test/sub?signature=SECRET&pot=SECRET')
+        try:
+            with tempfile.TemporaryDirectory() as temporary, \
+                    patch('requests.sessions.Session.request', autospec=True, side_effect=self.http_fixture), \
+                    patch.object(app, 'youtube_downloader', FakeYDL):
+                with self.assertRaises(app.SubtitleError) as caught:
+                    app.run('QRS8MkLhQmM', output_dir=temporary, progress=lambda _: None)
+                self.assertIn('RequestBlocked', caught.exception.details)
+                self.assertIn('HTTP Error 429', caught.exception.details)
+                self.assertNotIn('SECRET', caught.exception.details)
+        finally:
+            FakeYDL.failure = None
 
 
 class FakeAudioYDL(FakeYDL):
@@ -181,6 +281,9 @@ class FakeAudioYDL(FakeYDL):
 
 class TestRecentArchiveAudio(unittest.TestCase):
     def setUp(self):
+        direct = patch.object(app, 'fetch_direct_transcript', side_effect=app.SubtitleError('Direkter Abruf ohne Spur'))
+        direct.start()
+        self.addCleanup(direct.stop)
         self.audio_format = {'format_id': 'audio', 'protocol': 'https', 'filesize': 1000,
                              'acodec': 'opus', 'vcodec': 'none', 'ext': 'webm', 'url': 'https://example.test/audio'}
         self.rolling_format = {**self.audio_format, 'format_id': 'rolling', 'protocol': 'm3u8_native'}
@@ -277,17 +380,21 @@ class TestRealYoutubeExtractor(unittest.TestCase):
         with YoutubeDL({'quiet': True}) as plain:
             self.assertEqual(len(list(plain.get_info_extractor('Youtube')._extract_storyboard(response, 60))), 1)
 
-    def test_access_denial_not_suppressed_by_metadata_mode(self):
+    def test_player_denial_is_deferred_only_in_metadata_mode(self):
         from yt_dlp.utils import ExtractorError
 
         with app.youtube_downloader({**app.ydl_options(), 'ignore_no_formats_error': True}) as ydl:
             extractor = ydl.get_info_extractor('Youtube')
             for message in ('Sign in to confirm you are not a bot', 'Private video',
                             'The current session has been rate-limited by YouTube'):
-                with self.subTest(message=message), self.assertRaises(ExtractorError):
-                    extractor.raise_no_formats(message, expected=True)
+                with self.subTest(message=message):
+                    self.assertIsNone(extractor.raise_no_formats(message, expected=True))
+                    self.assertIn(message, ydl.subtitle_playback_errors)
             # No media formats alone must still permit available subtitle metadata.
             self.assertIsNone(extractor.raise_no_formats('No video formats found', expected=True))
+        with app.youtube_downloader(app.ydl_options()) as ydl:
+            with self.assertRaises(ExtractorError):
+                ydl.get_info_extractor('Youtube').raise_no_formats('Sign in to confirm you are not a bot', expected=True)
 
 
 class FakeWhisper:
