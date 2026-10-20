@@ -2,6 +2,14 @@
 
 [![In Colab öffnen](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Erikiss/yt-dlp/blob/subtitle-colab/colab/YouTube_Untertitel.ipynb)
 
+[**Schnelle GPU-Voreinstellung öffnen (A100, Turbo, Videolink bereits eingetragen)**](https://colab.research.google.com/github/Erikiss/yt-dlp/blob/subtitle-colab/colab/YouTube_Untertitel_GPU.ipynb)
+
+**Version 1.5:** Separates GPU-Notebook mit A100 als gewünschter Hardware, `turbo`, Batch 32, Beam 1 und automatischem ZIP-Download. Der Link zur Aufzeichnung `nWCutquolHk` ist bereits eingetragen und ihr Ende bestätigt. Einfach ▶ drücken; Colab kann eine Anmeldung oder Ausführungsbestätigung verlangen. Die GPU-Zuteilung hängt von Colab ab. Falls keine GPU verbunden ist, fordert das Notebook die Auswahl unter **Laufzeit → Laufzeittyp ändern** an, bevor Downloads beginnen. Der normale CPU-Lauf kann im bisherigen Notebook weiterlaufen.
+
+Der Schnellmodus verwendet `BatchedInferencePipeline`: Innerhalb jedes Zehn-Minuten-Abschnitts werden mehrere Audioteile gleichzeitig auf der GPU verarbeitet. `beam_size=1`, `best_of=1` und `temperature=0` reduzieren die Textsuche. Wortzeitstempel, Sprachaktivitätserkennung und Kontext an den Abschnittsgrenzen bleiben aktiv. Bei GPU-Speichermangel wird ausschließlich der unvollständige Abschnitt mit halbierter Batchgröße erneut gerechnet; Ergebnisse eines fehlgeschlagenen Versuchs werden verworfen. Schnellmodus und Normalmodus haben getrennte Sicherungen. Die normalen Sicherungen aus Version 1.3/1.4 bleiben kompatibel. Der Schnellmodus kann andere Erkennungsfehler liefern; er ist kein Nachweis einer auf jeder Hardware maximalen Geschwindigkeit.
+
+Downloadzeit, Modellvorbereitung sowie Audioaufbereitung und Spracherkennung pro Abschnitt werden getrennt ausgegeben. Nach jedem gesicherten Abschnitt erscheint eine grobe Restzeitschätzung anhand des in diesem Lauf gemessenen Tempos. Standardmäßig bleiben die Dateien im temporären Colab-Speicher; der fertige ZIP-Download wird automatisch angestoßen. Dauerhafte Drive-Sicherung ist vor dem Start optional zuschaltbar. Die Laufzeit wird nicht automatisch beendet.
+
 **Version 1.4:** Behebt `TypeError: open() got an unexpected keyword argument 'metadata_errors'` beim Start von Whisper. `faster-whisper==1.2.1` wird zusammen mit `av==18.1.0` installiert; PyAV 19 hat das von dieser Whisper-Version verwendete Argument entfernt ([Upstream-Fehlerbericht](https://github.com/SYSTRAN/faster-whisper/issues/1589)). Vor dem Modellstart wird der echte Audio-Decoder mit einer kurzen WAV-Datei geprüft. Die Einrichtung erkennt auch eine bereits ausgeführte ältere Notebook-Version. Workerfehler werden mit ihrer tatsächlichen Meldung zurückgegeben. Vorhandene Audio- und Transkriptionssicherungen bleiben kompatibel.
 
 **Eine laufende Sitzung mit Version 1.3 reparieren:** Eine zusätzliche Codezelle mit `%pip install -q "faster-whisper==1.2.1" "av==18.1.0"` ausführen und anschließend die bisherige Startzelle erneut starten. Die Laufzeit dafür nicht zurücksetzen: Die Tonspur unter `/content` bleibt dann erhalten. Whisper läuft in einem neuen Unterprozess und lädt dort die korrigierten Pakete; ein Neustart der Colab-Laufzeit ist dafür nicht erforderlich.
@@ -25,7 +33,7 @@ Keine Kommandozeile, kein API-Key und kein lokales Installieren nötig. Das Note
 - Zuerst versucht `youtube-transcript-api` vorhandene Untertitel abzurufen. Bei einem Fehler oder einer leeren Spur folgt yt-dlp aus diesem Fork. Beide Wege bevorzugen manuelle Untertitel in der Originalsprache vor YouTube-Autountertiteln. Wenn die Originalsprache nicht ermittelbar ist, wird das ausdrücklich bezeichnet.
 - Fehlen Untertitel, lädt yt-dlp die Tonspur und Whisper erzeugt Untertitel. Falls eine Tonspur nicht einzeln verfügbar ist, kann der Download ein Video mit Ton enthalten.
 - Der Modus **Nur vorhandene Untertitel** verhindert jede KI-Transkription. **KI neu erzeugen** nutzt Whisper auch bei vorhandenen Untertiteln.
-- Vorhandene Untertitel benötigen keine GPU. Whisper nutzt bei `auto` **turbo auf GPU** und **small auf CPU**. Für lange Videos ist eine T4 sinnvoll; eine A100 ist nicht nötig. Die Laufzeit wird von diesem Notebook nicht automatisch umgestellt.
+- Vorhandene Untertitel benötigen keine GPU. Whisper nutzt bei `auto` **turbo auf GPU** und **small auf CPU**. Für lange Videos reicht auch eine T4. Das separate GPU-Notebook hinterlegt A100 als gewünschte Colab-Hardware; die tatsächliche Zuteilung übernimmt Colab. Der Code stellt eine bereits laufende Sitzung nicht automatisch um.
 - Keine Übersetzung, Zusammenfassung oder künstliche Längenbegrenzung. Erkennungsfehler bleiben möglich, besonders bei Fachbegriffen, Musik und überlappender Sprache.
 - `/live/VIDEO_ID` ist auch für beendete Aufzeichnungen gültig. Ein noch als live gemeldetes Video wird erst nach Bestätigung **Stream_bereits_beendet** als Aufzeichnung versucht. Eine dauerhafte Liveaufnahme und Playlists werden nicht verarbeitet. Ein Videolink mit Playlist-Zusatz verarbeitet nur dieses Video.
 
@@ -76,6 +84,8 @@ python colab/subtitle_tool.py 'https://www.youtube.com/watch?v=VIDEO_ID' --mode 
 # Optional: Sprache erkennen
 python -m pip install 'faster-whisper==1.2.1' 'av==18.1.0'
 python colab/subtitle_tool.py --file lecture.mp3 --model small
+# Optional: schnelle Verarbeitung auf einer vorhandenen CUDA-GPU
+python colab/subtitle_tool.py --file lecture.mp3 --model turbo --fast-gpu
 ```
 
 ## Wartung und Prüfung
@@ -87,7 +97,7 @@ python -m unittest discover -s colab -p 'test_subtitle_tool.py' -v
 python colab/build_notebook.py
 ```
 
-Die 31 Offlineprüfungen decken URL-Validierung, Sprachwahl, rollende Wiederholungen, lange Transkripte, ZIP/SRT/TXT-Ausgaben, Zugriffsfehler und unterbrochene/fertiggestellte Whisper-Sicherungen ab. Für beendete Streams prüfen sie außerdem widersprüchliche Live-Angaben, vergangene/zukünftige Endzeiten im echten Extractor, die ausdrückliche Bestätigung, unvollständige Audioformate und zu kurze Downloads. Der echte Transkriptclient wird mit HTTP-Testantworten geprüft; dabei darf kein Medienabruf gestartet werden. Weitere Fälle prüfen abrufbare Untertitel trotz Playerfehler und die Diagnose beider fehlgeschlagener Wege. Die Whisper-Prüfung simuliert das Modell; sie misst keine Erkennungsqualität und prüft keinen echten GPU-Lauf. Ein vollständiger Durchlauf in Google Colab muss mit einem tatsächlich zugänglichen Video erfolgen.
+Die 36 Offlineprüfungen decken URL-Validierung, Sprachwahl, rollende Wiederholungen, lange Transkripte, ZIP/SRT/TXT-Ausgaben, Zugriffsfehler und unterbrochene/fertiggestellte Whisper-Sicherungen ab. Für beendete Streams prüfen sie außerdem widersprüchliche Live-Angaben, vergangene/zukünftige Endzeiten im echten Extractor, die ausdrückliche Bestätigung, unvollständige Audioformate und zu kurze Downloads. Der echte Transkriptclient wird mit HTTP-Testantworten geprüft; dabei darf kein Medienabruf gestartet werden. Weitere Fälle prüfen abrufbare Untertitel trotz Playerfehler und die Diagnose beider fehlgeschlagener Wege. Für den GPU-Schnellmodus werden außerdem die Ablehnung einer CPU-Laufzeit, Wiederholung nach Speichermangel ohne doppelte Ausgaben, Weitergabe anderer Fehler, Wiederaufnahme mit korrekten Zeitmarken sowie die Kompatibilität alter Sicherungen geprüft. Die Whisper-Prüfung simuliert das Modell; sie misst keine Erkennungsqualität und prüft keinen echten GPU-Lauf. Ein vollständiger Durchlauf in Google Colab muss mit einem tatsächlich zugänglichen Video erfolgen.
 
 Für Version 1.4 wurde der gemeldete Fehler zusätzlich mit den echten Paketen `faster-whisper==1.2.1` und `av==19.0.1` reproduziert. Nach Installation von `av==18.1.0` bestanden sowohl der Decodertest als auch das Einlesen einer von FFmpeg erzeugten WAV-Datei (6.400 Float32-Samples bei 16 kHz). Für Python 3.13 wurde die Verfügbarkeit des passenden Linux-Wheels geprüft; der Decoderlauf selbst fand unter Python 3.12 statt.
 

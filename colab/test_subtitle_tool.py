@@ -449,5 +449,123 @@ class TestResume(unittest.TestCase):
             self.assertEqual(len(list(root.glob('whisper-*'))), 2)
 
 
+class TestFastGPU(unittest.TestCase):
+    def test_cpu_is_not_silently_used_for_gpu_preset(self):
+        constructor = Mock()
+        modules = {'ctranslate2': types.SimpleNamespace(get_cuda_device_count=lambda: 0),
+                   'faster_whisper': types.SimpleNamespace(WhisperModel=constructor)}
+        with patch.dict(sys.modules, modules), patch.object(app, 'audio_duration', return_value=600):
+            with self.assertRaisesRegex(app.SubtitleError, 'benötigt eine GPU'):
+                app.transcribe_audio(Path('audio.wav'), Path('unused'), {}, fast_gpu=True)
+        constructor.assert_not_called()
+
+    def test_oom_discards_partial_output_and_retries_smaller_fresh_batch(self):
+        calls, pipelines = [], []
+
+        class Pipeline:
+            def __init__(self, model):
+                pipelines.append(self)
+
+            def transcribe(self, audio, **options):
+                calls.append(options)
+
+                def segments():
+                    if options['batch_size'] == 32:
+                        yield 'incomplete, must be discarded'
+                        raise RuntimeError('CUDA failed with error out of memory')
+                    yield 'complete'
+
+                return segments(), types.SimpleNamespace(language='en')
+
+        messages = []
+        with patch.dict(sys.modules, {'faster_whisper': types.SimpleNamespace(BatchedInferencePipeline=Pipeline)}):
+            segments, info, batch_size = app.transcribe_chunk(
+                object(), 'audio.wav', 'en', batch_size=32, progress=messages.append)
+        self.assertEqual(segments, ['complete'])
+        self.assertEqual(batch_size, 16)
+        self.assertEqual([call['batch_size'] for call in calls], [32, 16])
+        self.assertEqual(len(pipelines), 2)
+        self.assertTrue(all(call['beam_size'] == 1 and call['best_of'] == 1 and call['temperature'] == 0.0
+                            and call['word_timestamps'] for call in calls))
+        self.assertIn('Batch 16', messages[0])
+
+    def test_unrelated_gpu_failure_is_not_retried(self):
+        pipeline = Mock()
+        pipeline.transcribe.side_effect = RuntimeError('missing libcudnn')
+        with patch.dict(sys.modules, {'faster_whisper': types.SimpleNamespace(
+                BatchedInferencePipeline=Mock(return_value=pipeline))}):
+            with self.assertRaisesRegex(RuntimeError, 'missing libcudnn'):
+                app.transcribe_chunk(object(), 'audio.wav', None, batch_size=32)
+        self.assertEqual(pipeline.transcribe.call_count, 1)
+
+    def test_fast_gpu_resume_boundaries_and_separate_standard_checkpoint(self):
+        batch_calls = []
+
+        class Pipeline:
+            def __init__(self, model):
+                self.model = model
+
+            def transcribe(self, audio, **options):
+                batch_calls.append(options)
+                return self.model.transcribe(audio, **options)
+
+        modules = {'ctranslate2': types.SimpleNamespace(get_cuda_device_count=lambda: 1),
+                   'faster_whisper': types.SimpleNamespace(WhisperModel=FakeWhisper,
+                                                          BatchedInferencePipeline=Pipeline)}
+        FakeWhisper.attempts, FakeWhisper.should_fail = 0, True
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(sys.modules, modules), \
+                patch.object(app, 'audio_duration', return_value=601), patch.object(app.subprocess, 'run'), \
+                patch.object(app, 'check_audio_decoder'):
+            root = Path(temporary)
+            audio = root / 'audio.wav'
+            audio.write_bytes(b'gpu resume fixture')
+            metadata = {'title': 'GPU resume', 'source': 'Whisper'}
+            kwargs = dict(model_name='small', fast_gpu=True, progress=lambda _: None)
+            with self.assertRaisesRegex(RuntimeError, 'interruption'):
+                app.transcribe_audio(audio, root, metadata, **kwargs)
+            checkpoint = next(root.glob('whisper-*/fortschritt.json'))
+            self.assertEqual(json.loads(checkpoint.read_text())['next_chunk'], 1)
+            self.assertFalse(checkpoint.with_name('info.json').exists())
+            FakeWhisper.should_fail = False
+            result = app.transcribe_audio(audio, root, metadata, **kwargs)
+            self.assertEqual((result.directory / 'transkript.txt').read_text().split(), ['before', 'after'])
+            self.assertIn('00:10:00,100', (result.directory / 'untertitel.srt').read_text())
+            self.assertEqual(FakeWhisper.attempts, 3)
+            app.transcribe_audio(audio, root, metadata, **kwargs)
+            self.assertEqual(FakeWhisper.attempts, 3)
+            with zipfile.ZipFile(result.archive) as archive:
+                self.assertIsNone(archive.testzip())
+            self.assertTrue(json.loads((result.directory / 'info.json').read_text())['inference']['fast_gpu'])
+            standard = app.transcribe_audio(audio, root, metadata, model_name='small', progress=lambda _: None)
+            self.assertNotEqual(standard.directory, result.directory)
+            self.assertEqual(len(list(root.glob('whisper-*'))), 2)
+            self.assertTrue(all(call['batch_size'] == 32 for call in batch_calls))
+
+    def test_legacy_standard_checkpoint_is_reused(self):
+        import hashlib
+
+        constructor = Mock(side_effect=AssertionError('Completed checkpoint must skip model loading'))
+        modules = {'ctranslate2': types.SimpleNamespace(get_cuda_device_count=lambda: 0),
+                   'faster_whisper': types.SimpleNamespace(WhisperModel=constructor)}
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(sys.modules, modules), \
+                patch.object(app, 'audio_duration', return_value=600):
+            root = Path(temporary)
+            audio = root / 'audio.wav'
+            audio.write_bytes(b'old audio')
+            signature = {'tool_version': 1, 'audio_sha256': app.file_digest(audio), 'model': 'small',
+                         'chunk_seconds': 600, 'context_seconds': 3, 'beam_size': 5,
+                         'vad_filter': True, 'word_timestamps': True}
+            key = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()[:16]
+            directory = root / f'whisper-{key}'
+            directory.mkdir()
+            (directory / 'fortschritt.json').write_text(json.dumps({
+                'signature': signature, 'next_chunk': 1, 'language': 'en',
+                'cues': [{'start': 0.0, 'end': 2.0, 'text': 'Existing saved transcript'}],
+            }))
+            result = app.transcribe_audio(audio, root, {'title': 'Old'}, progress=lambda _: None)
+            self.assertEqual(result.directory, directory)
+            self.assertIn('Existing saved transcript', (directory / 'transkript.txt').read_text())
+
+
 if __name__ == '__main__':
     unittest.main()

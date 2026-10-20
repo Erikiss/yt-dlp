@@ -578,7 +578,35 @@ def check_audio_decoder() -> None:
         raise SubtitleError(message, details=error_detail(error)) from error
 
 
-def transcribe_audio(audio: Path, root: Path, metadata: dict, *, model_name='auto', progress=print) -> Result:
+def transcribe_chunk(model, audio, language, *, batch_size=0, progress=print):
+    """Materialize one chunk before saving; discard a failed batch completely."""
+    options = dict(language=language, task='transcribe', vad_filter=True,
+                   condition_on_previous_text=False, word_timestamps=True)
+    while True:
+        try:
+            if batch_size:
+                from faster_whisper import BatchedInferencePipeline
+                # A fresh pipeline also resets word-alignment state after an OOM.
+                recognizer = BatchedInferencePipeline(model)
+                segments, detected = recognizer.transcribe(
+                    str(audio), **options, batch_size=batch_size, beam_size=1,
+                    best_of=1, temperature=0.0,
+                )
+            else:
+                segments, detected = model.transcribe(str(audio), **options, beam_size=5)
+            return list(segments), detected, batch_size
+        except RuntimeError as error:
+            message = str(error).lower()
+            out_of_memory = any(marker in message for marker in (
+                'out of memory', 'cublas_status_alloc_failed', 'cudnn_status_alloc_failed'))
+            if not out_of_memory or batch_size <= 1:
+                raise
+            batch_size = max(1, batch_size // 2)
+            progress(f'GPU-Speicher knapp: wiederhole diesen Abschnitt mit Batch {batch_size}.')
+
+
+def transcribe_audio(audio: Path, root: Path, metadata: dict, *, model_name='auto',
+                     fast_gpu=False, progress=print) -> Result:
     try:
         import ctranslate2
         from faster_whisper import WhisperModel
@@ -590,6 +618,9 @@ def transcribe_audio(audio: Path, root: Path, metadata: dict, *, model_name='aut
         has_gpu = ctranslate2.get_cuda_device_count() > 0
     except RuntimeError:
         has_gpu = False
+    if fast_gpu and not has_gpu:
+        raise SubtitleError('Der GPU-Schnellmodus benötigt eine GPU. In diesem Notebook '
+                            '„Laufzeit → Laufzeittyp ändern → A100 GPU“ wählen und erneut starten.')
     device, precision = ('cuda', 'float16') if has_gpu else ('cpu', 'int8')
     if model_name == 'auto':
         model_name = 'turbo' if has_gpu else 'small'
@@ -601,6 +632,9 @@ def transcribe_audio(audio: Path, root: Path, metadata: dict, *, model_name='aut
         'model': model_name, 'chunk_seconds': CHUNK_SECONDS, 'context_seconds': CONTEXT_SECONDS,
         'beam_size': 5, 'vad_filter': True, 'word_timestamps': True,
     }
+    if fast_gpu:
+        # Keep the old signature unchanged in standard mode (v1.3/v1.4 resume).
+        signature.update(beam_size=1, best_of=1, temperature=0.0, pipeline='batched-v1')
     key = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()[:16]
     directory = root / f'whisper-{key}'
     checkpoint = directory / 'fortschritt.json'
@@ -618,7 +652,9 @@ def transcribe_audio(audio: Path, root: Path, metadata: dict, *, model_name='aut
     count = math.ceil(duration / CHUNK_SECONDS)
     cues = [Cue(**item) for item in state['cues']]
     metadata = {**metadata, 'source': f'Whisper ({model_name})', 'duration_seconds': duration,
-                'model': model_name, 'language': state['language'] or 'unknown'}
+                'model': model_name, 'language': state['language'] or 'unknown',
+                'inference': {'device': device, 'precision': precision, 'fast_gpu': fast_gpu,
+                              'beam_size': signature['beam_size']}}
     if state['next_chunk'] >= count:
         progress('Vollständige Sicherung gefunden – kein erneutes Transkribieren nötig.')
         return make_result(directory, cues, metadata)
@@ -629,13 +665,19 @@ def transcribe_audio(audio: Path, root: Path, metadata: dict, *, model_name='aut
     progress(f'Zwischenstände: {directory}')
     if state['next_chunk']:
         progress(f'Setze nach {state["next_chunk"]} bereits gesicherten Abschnitten fort.')
+    batch_size = 32 if fast_gpu else 0
+    if fast_gpu:
+        progress('GPU-Schnellmodus: parallele Verarbeitung bis Batch 32, Beam 1.')
+    model_started = time.perf_counter()
     try:
         model = WhisperModel(model_name, device=device, compute_type=precision)
     except Exception as error:
         raise SubtitleError('Whisper konnte nicht geladen werden. Internetzugriff und freien Speicher prüfen; '
                             'bei CUDA-Fehlern die Colab-Laufzeit neu starten oder CPU wählen. '
                             f'Detail: {str(error)[:300]}') from error
+    progress(f'Modell bereit nach {time.perf_counter() - model_started:.1f} s (einschließlich Modelldownload).')
 
+    processed_audio, processing_seconds = 0.0, 0.0
     with tempfile.TemporaryDirectory(prefix='subtitle-chunk-') as scratch:
         chunk_file = Path(scratch) / 'chunk.wav'
         for index in range(state['next_chunk'], count):
@@ -644,13 +686,15 @@ def transcribe_audio(audio: Path, root: Path, metadata: dict, *, model_name='aut
             context_start = max(0, start - CONTEXT_SECONDS)
             context_stop = min(duration, stop + CONTEXT_SECONDS)
             progress(f'Abschnitt {index + 1}/{count}: {timestamp(start)} – {timestamp(stop)}')
+            chunk_started = time.perf_counter()
             subprocess.run(['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
                             '-ss', str(context_start), '-i', str(audio), '-t', str(context_stop - context_start),
                             '-vn', '-ac', '1', '-ar', '16000', str(chunk_file)], check=True)
-            segments, detected = model.transcribe(
-                str(chunk_file), beam_size=5, language=state['language'], task='transcribe',
-                vad_filter=True, condition_on_previous_text=False, word_timestamps=True,
+            prepared = time.perf_counter()
+            segments, detected, batch_size = transcribe_chunk(
+                model, chunk_file, state['language'], batch_size=batch_size, progress=progress,
             )
+            recognized = time.perf_counter()
             chunk_cues = []
             for segment in segments:
                 # Context on both sides protects words at chunk boundaries. Keep
@@ -676,12 +720,20 @@ def transcribe_audio(audio: Path, root: Path, metadata: dict, *, model_name='aut
             write_exports(directory, cues, {**metadata, 'completed_chunks': index + 1,
                                            'total_chunks': count}, partial=True)
             progress(f'Gesichert: {index + 1}/{count}.')
+            elapsed = max(time.perf_counter() - chunk_started, 0.001)
+            processed_audio += stop - start
+            processing_seconds += elapsed
+            remaining = (duration - stop) * processing_seconds / processed_audio
+            progress(f'Zeit: Audioaufbereitung {prepared - chunk_started:.1f} s · '
+                     f'Spracherkennung {recognized - prepared:.1f} s · '
+                     f'{(stop - start) / elapsed:.1f}× Echtzeit · '
+                     f'geschätzt noch {remaining / 60:.1f} min.')
     return make_result(directory, cues, metadata)
 
 
 def run(url: str = '', *, output_dir: str | Path = 'youtube_subtitles',
         local_file: str | Path | None = None, mode: str = 'auto', model_name: str = 'auto',
-        stream_ended: bool = False, progress=print, transcriber=None) -> Result:
+        stream_ended: bool = False, fast_gpu: bool = False, progress=print, transcriber=None) -> Result:
     if mode not in ('auto', 'subtitles', 'whisper'):
         raise SubtitleError('Unbekannter Modus.')
     if model_name not in ('auto', 'small', 'medium', 'turbo', 'large-v3'):
@@ -760,6 +812,7 @@ def run(url: str = '', *, output_dir: str | Path = 'youtube_subtitles',
                 message = 'Keiner der Abrufwege hat vorhandene Untertitel geliefert. Für Spracherkennung „Automatisch“ wählen.'
             raise SubtitleError(message, details=combined_error(attempts).details if attempts else '')
         progress('Lade nur die Tonspur für die Spracherkennung …')
+        download_started = time.perf_counter()
         cache = output_dir / '_audio' / video_id
         cache.mkdir(parents=True, exist_ok=True)
         try:
@@ -802,7 +855,12 @@ def run(url: str = '', *, output_dir: str | Path = 'youtube_subtitles',
         except Exception as error:
             attempts.append(('yt-dlp: Tonspur', error))
             raise combined_error(attempts) from error
-    return (transcriber or transcribe_audio)(audio, root, metadata, model_name=model_name, progress=progress)
+        progress(f'Tonspur bereit nach {time.perf_counter() - download_started:.1f} s. '
+                 'Die weitere Spracherkennung arbeitet mit der gespeicherten Datei, ohne YouTube-Abrufe.')
+    options = {'model_name': model_name, 'progress': progress}
+    if fast_gpu:
+        options['fast_gpu'] = True
+    return (transcriber or transcribe_audio)(audio, root, metadata, **options)
 
 
 def main():
@@ -813,10 +871,11 @@ def main():
     parser.add_argument('--mode', choices=('auto', 'subtitles', 'whisper'), default='auto')
     parser.add_argument('--model', choices=('auto', 'small', 'medium', 'turbo', 'large-v3'), default='auto')
     parser.add_argument('--stream-ended', action='store_true', help='Bestätigt: Der Livestream ist bereits beendet')
+    parser.add_argument('--fast-gpu', action='store_true', help='GPU-Batches mit Beam 1; benötigt CUDA')
     args = parser.parse_args()
     try:
         result = run(args.url, local_file=args.local_file, output_dir=args.output,
-                     mode=args.mode, model_name=args.model, stream_ended=args.stream_ended)
+                     mode=args.mode, model_name=args.model, stream_ended=args.stream_ended, fast_gpu=args.fast_gpu)
         print(f'Fertig: {result.archive}')
     except SubtitleError as error:
         parser.exit(1, f'{error}\n' + (f'\nTechnische Details:\n{error.details}\n' if error.details else ''))

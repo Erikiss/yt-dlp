@@ -1,6 +1,7 @@
 """Rebuild the self-contained, single-form Colab notebook (standard library only)."""
 
 import json
+import copy
 from pathlib import Path
 
 
@@ -17,17 +18,19 @@ Stream_bereits_beendet = False #@param {type:"boolean"}
 In_Google_Drive_sichern = False #@param {type:"boolean"}
 Datei_hochladen = False #@param {type:"boolean"}
 Whisper_Modell = "auto" #@param ["auto", "small", "medium", "turbo", "large-v3"]
+GPU_Schnellmodus = False #@param {type:"boolean"}
 ZIP_automatisch_herunterladen = True #@param {type:"boolean"}
 #@markdown **Drive:** Ergebnisse und KI-Zwischenstände dauerhaft sichern (Google fragt nach Freigabe).
 #@markdown **Stream bereits beendet:** anhaken, falls YouTube eine beendete Aufzeichnung noch als live meldet. Auch `/live/`-Links sind gültig.
 #@markdown **Datei hochladen:** eigene Audio-/Videodatei statt Link, z. B. wenn YouTube den Abruf blockiert.
 #@markdown **KI:** Sprache bleibt im Original. `auto` nutzt Turbo auf GPU, Small auf CPU. Keine Übersetzung.
+#@markdown **GPU-Schnellmodus:** mehrere Audioteile gleichzeitig, schnellere Textsuche. Benötigt eine GPU; Erkennungsfehler können sich verändern.
 
 '''
 source = form + f'_SUBTITLE_CORE = {core!r}\nexec(compile(_SUBTITLE_CORE, "subtitle_tool.py", "exec"))\n\n' + ui
 intro = '''# YouTube → Untertitel & Transkript
 
-**Version 1.4** · Behebt den Whisper-Startfehler `metadata_errors`: passende Paketversionen und ein Audio-Decodertest vor dem Modellstart. Zwei Abrufwege für vorhandene Untertitel bleiben enthalten. Bei veraltetem Live-Status **Stream_bereits_beendet** anhaken.
+**Version 1.5** · Zusätzlicher GPU-Schnellmodus und Zeitmessung pro Abschnitt. [A100-Voreinstellung öffnen](https://colab.research.google.com/github/Erikiss/yt-dlp/blob/subtitle-colab/colab/YouTube_Untertitel_GPU.ipynb). Die bisherigen CPU-Einstellungen bleiben Standard; Sicherungen aus Version 1.3/1.4 lassen sich damit fortsetzen.
 
 **Link einfügen. ▶ drücken. Dateien herunterladen.** Funktioniert im Browser auf Handy, Tablet und PC.
 
@@ -64,3 +67,38 @@ notebook = {
 destination = HERE / 'YouTube_Untertitel.ipynb'
 destination.write_text(json.dumps(notebook, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
 print(destination)
+
+# A different notebook path creates a separate Colab session from the CPU run.
+gpu_notebook = copy.deepcopy(notebook)
+gpu_notebook['metadata']['accelerator'] = 'GPU'
+gpu_notebook['metadata']['colab'].update(name='YouTube_Untertitel_GPU.ipynb', gpuType='A100')
+gpu_form = form.replace('YouTube_Link = ""', 'YouTube_Link = "https://www.youtube.com/watch?v=nWCutquolHk"')
+gpu_form = gpu_form.replace('Stream_bereits_beendet = False', 'Stream_bereits_beendet = True')
+gpu_form = gpu_form.replace('Whisper_Modell = "auto"', 'Whisper_Modell = "turbo"')
+gpu_form = gpu_form.replace('GPU_Schnellmodus = False', 'GPU_Schnellmodus = True')
+gpu_form = gpu_form.replace('YouTube-Link einfügen → ▶ starten', 'Dein Video ist eingetragen → ▶ starten')
+gpu_form = gpu_form.replace('**Nur den Link einfügen.**', '**Dein Video ist eingetragen. Einfach ▶ drücken.**')
+gpu_source = gpu_form + source[len(form):]
+gpu_intro = '''# YouTube → Untertitel · schnelle GPU-Voreinstellung
+
+**Version 1.5 · Dein Video ist bereits eingetragen. Einfach ▶ drücken.**
+
+A100 als gewünschte GPU, Whisper **turbo**, parallele Verarbeitung und schnelle Textsuche sind voreingestellt. Installation, Abruf und ZIP-Download laufen automatisch. Vorhandene Untertitel werden weiterhin zuerst versucht; falls sie nicht abrufbar sind, wird die Tonspur transkribiert. Die Sprache bleibt im Original.
+
+Colab kann vor dem Start eine Anmeldung oder „Trotzdem ausführen“ verlangen. Die tatsächlich zugeteilte GPU wird ausgegeben. Falls noch keine GPU verbunden ist, **Laufzeit → Laufzeittyp ändern → A100 GPU** wählen. Die Zuteilung hängt von deinem Colab-Konto und der Verfügbarkeit ab. Eine andere NVIDIA-GPU funktioniert ebenfalls.
+
+**Zum parallelen Start dieses separate Notebook benutzen.** Deinen laufenden CPU-Job im anderen Notebook weiterlaufen lassen. Hier wird ein eigener Durchlauf gestartet.
+
+Nach jedem Zehn-Minuten-Abschnitt siehst du Bearbeitungszeit, Geschwindigkeit und geschätzte Restzeit. Download, Modellvorbereitung und eigentliche Spracherkennung werden getrennt ausgewiesen. Turbo mit Schnellmodus kann andere Erkennungsfehler liefern als Small im bisherigen CPU-Lauf. Eine konkrete Beschleunigung ist erst nach dem Lauf gemessen.
+
+**Speichern:** Am Ende wird der ZIP-Download angestoßen; zusätzlich erscheinen Downloadknöpfe für TXT/SRT/VTT. Für dauerhafte Zwischenstände vor dem Start optional **In_Google_Drive_sichern** aktivieren und Googles Freigabe bestätigen. Ohne Drive bleiben die Zwischenstände nur in der Colab-Laufzeit. Die GPU-Laufzeit bei Bedarf nach dem Download manuell trennen.
+
+Für ein anderes Video einfach **YouTube_Link** austauschen. **Stream_bereits_beendet** ist für die hier eingetragene Aufzeichnung aktiviert; bei anderen Videos nur aktivieren, wenn ein gemeldeter Livestream tatsächlich beendet ist.
+
+[Anleitung](https://github.com/Erikiss/yt-dlp/blob/subtitle-colab/colab/README.md) · [Normale Voreinstellung](https://colab.research.google.com/github/Erikiss/yt-dlp/blob/subtitle-colab/colab/YouTube_Untertitel.ipynb)
+'''
+gpu_notebook['cells'][0]['source'] = gpu_intro.splitlines(keepends=True)
+gpu_notebook['cells'][1]['source'] = gpu_source.splitlines(keepends=True)
+gpu_destination = HERE / 'YouTube_Untertitel_GPU.ipynb'
+gpu_destination.write_text(json.dumps(gpu_notebook, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+print(gpu_destination)

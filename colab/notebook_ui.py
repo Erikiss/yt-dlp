@@ -40,7 +40,7 @@ def _setup_ffmpeg():
         subprocess.run(arguments, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
-def _colab_transcriber(audio, root, metadata, *, model_name, progress):
+def _colab_transcriber(audio, root, metadata, *, model_name, progress, fast_gpu=False):
     global _subtitle_whisper_ready
     _setup_ffmpeg()
     # CUDA libraries must be on LD_LIBRARY_PATH BEFORE the worker starts.
@@ -63,12 +63,13 @@ def _colab_transcriber(audio, root, metadata, *, model_name, progress):
     job = worker_directory / 'job.json'
     result_path = worker_directory / 'result.json'
     job.write_text(json.dumps({'audio': str(audio), 'root': str(root), 'metadata': metadata,
-                               'model_name': model_name}), encoding='utf-8')
+                               'model_name': model_name, 'fast_gpu': fast_gpu}), encoding='utf-8')
     worker.write_text(_SUBTITLE_CORE + '''
 import sys
 job = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
 try:
-    result = transcribe_audio(Path(job['audio']), Path(job['root']), job['metadata'], model_name=job['model_name'])
+    result = transcribe_audio(Path(job['audio']), Path(job['root']), job['metadata'],
+                             model_name=job['model_name'], fast_gpu=job.get('fast_gpu', False))
 except Exception as error:
     Path(sys.argv[2]).write_text(json.dumps({'error': str(error), 'details': error_detail(error)}), encoding='utf-8')
     sys.exit(1)
@@ -134,12 +135,28 @@ def _show_result(result):
             print('Automatischer Download nicht möglich. Bitte einen Downloadknopf oder den Dateibereich verwenden.')
 
 
+def _require_gpu():
+    if shutil.which('nvidia-smi'):
+        result = subprocess.run(['nvidia-smi', '--query-gpu=name,memory.total', '--format=csv,noheader'],
+                                capture_output=True, text=True, timeout=20)
+        if result.returncode == 0 and result.stdout.strip():
+            print(f'GPU verbunden: {result.stdout.strip()}', flush=True)
+            return
+    raise SubtitleError('Für diese schnelle Variante bitte „Laufzeit → Laufzeittyp ändern → A100 GPU“ '
+                        'wählen und erneut ▶ drücken. Auch eine andere NVIDIA-GPU funktioniert. '
+                        'Colab muss die GPU erst zuweisen; die laufende CPU-Sitzung im anderen Notebook beibehalten.')
+
+
 def _start_colab():
     from google.colab import files
 
-    print('Untertitel-Tool · Version 1.4', flush=True)
+    print('Untertitel-Tool · Version 1.5', flush=True)
+    fast_gpu = globals().get('GPU_Schnellmodus', False)
     if not Datei_hochladen:
         youtube_url(YouTube_Link)  # Fail before installing anything for an empty link.
+    if fast_gpu and Modus != 'Nur vorhandene Untertitel':
+        _require_gpu()
+    if not Datei_hochladen:
         _setup_ytdlp()
     output = Path('/content/YouTube_Untertitel')
     if In_Google_Drive_sichern:
@@ -165,7 +182,8 @@ def _start_colab():
     if mode != 'subtitles':
         _setup_ffmpeg()  # Also needed to check the duration of a fresh recording.
     result = run(YouTube_Link, local_file=local_file, output_dir=output, mode=mode,
-                 model_name=Whisper_Modell, stream_ended=Stream_bereits_beendet, transcriber=_colab_transcriber,
+                 model_name=Whisper_Modell, stream_ended=Stream_bereits_beendet, fast_gpu=fast_gpu,
+                 transcriber=_colab_transcriber,
                  progress=lambda message: print(message, flush=True))
     _show_result(result)
 
